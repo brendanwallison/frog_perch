@@ -41,20 +41,20 @@ def build_tf_dataset(dataset_obj, batch_size):
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
-def train(label_mode=config.LABEL_MODE, epochs=config.EPOCHS, batch_size=config.BATCH_SIZE, perch_savedmodel_path=None):
+def train(label_mode=config.LABEL_MODE, epochs=config.EPOCHS, batch_size=config.BATCH_SIZE):
     # instantiate Python dataset objects for train & val
     train_ds_obj = FrogPerchDataset(audio_dir=config.AUDIO_DIR, annotation_dir=config.ANNOTATION_DIR,
                                     train=True, pos_ratio=config.POS_RATIO, random_seed=config.RANDOM_SEED,
-                                    label_mode=label_mode, perch_savedmodel_path=perch_savedmodel_path)
+                                    label_mode=label_mode)
     val_ds_obj = FrogPerchDataset(audio_dir=config.AUDIO_DIR, annotation_dir=config.ANNOTATION_DIR,
                                   train=False, pos_ratio=config.POS_RATIO, random_seed=config.RANDOM_SEED,
-                                  label_mode=label_mode, perch_savedmodel_path=perch_savedmodel_path)
+                                  label_mode=label_mode)
 
     train_ds = build_tf_dataset(train_ds_obj, batch_size=batch_size)
     val_ds = build_tf_dataset(val_ds_obj, batch_size=batch_size)
 
     # model
-    model = build_downstream(spatial_shape=(16,4,1536), label_mode=label_mode, pool_method='mean')
+    model = build_downstream(spatial_shape=(16,4,1536), label_mode=label_mode, pool_method='conv')
 
     if label_mode == 'binary':
         loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)

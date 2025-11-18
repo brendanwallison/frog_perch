@@ -6,7 +6,6 @@ AUDIO_DIR = 'D:/Datasets/frog_calls/round_2'            # wav files (likely 16 k
 ANNOTATION_DIR = 'D:/Datasets/frog_calls/round_2'     # Raven .Table.1.selections.txt files
 
 # Perch (v2)
-PERCH_SAVEDMODEL_PATH = '/path/to/perch_saved_model'  # Kaggle Perch v2 saved_model dir
 PERCH_SAMPLE_RATE = 32000
 PERCH_CLIP_SECONDS = 5.0
 PERCH_CLIP_SAMPLES = int(PERCH_SAMPLE_RATE * PERCH_CLIP_SECONDS)  # 160000

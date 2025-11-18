@@ -46,7 +46,7 @@ class FrogPerchDataset:
 
     def __init__(self, audio_dir=None, annotation_dir=None, train=True,
                  test_split=None, pos_ratio=None, random_seed=None,
-                 label_mode='count', perch_savedmodel_path=None):
+                 label_mode='count'):
         self.audio_dir = audio_dir or config.AUDIO_DIR
         self.annotation_dir = annotation_dir or config.ANNOTATION_DIR
         self.train = train
@@ -73,7 +73,7 @@ class FrogPerchDataset:
         self.neg_sampler = RangeSampler(self.negative_ranges)
 
         # load Perch
-        self.perch = PerchWrapper(perch_savedmodel_path or config.PERCH_SAVEDMODEL_PATH)
+        self.perch = PerchWrapper()
 
     def _get_split_path(self):
         return os.path.join(self.audio_dir, f"dataset_split_seed{self.random_seed}_split{self.test_split}.json")
