@@ -1,0 +1,51 @@
+[
+  {
+    "pool_method": "bottleneck1x1",
+    "val_loss": 0.5365912318229675,
+    "metrics": [
+      0.7303225994110107
+    ]
+  },
+  {
+    "pool_method": "attn",
+    "val_loss": 0.5449063777923584,
+    "metrics": [
+      0.7393548488616943
+    ]
+  },
+  {
+    "pool_method": "conv",
+    "val_loss": 0.5198747515678406,
+    "metrics": [
+      0.6993548274040222
+    ]
+  },
+  {
+    "pool_method": "mean",
+    "val_loss": 0.538982093334198,
+    "metrics": [
+      0.7187096476554871
+    ]
+  },
+  {
+    "pool_method": "mlp_flat",
+    "val_loss": 0.5487396717071533,
+    "metrics": [
+      0.7083870768547058
+    ]
+  },
+  {
+    "pool_method": "avgmax",
+    "val_loss": 0.609934389591217,
+    "metrics": [
+      0.7225806713104248
+    ]
+  },
+  {
+    "pool_method": "conv2",
+    "val_loss": 0.5042315721511841,
+    "metrics": [
+      0.7045161128044128
+    ]
+  }
+]

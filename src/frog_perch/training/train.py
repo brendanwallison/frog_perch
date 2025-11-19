@@ -1,4 +1,4 @@
-# training/train.py
+# src/frog_perch/training/train.py
 import os
 import numpy as np
 import tensorflow as tf
@@ -7,73 +7,125 @@ from frog_perch.datasets.frog_dataset import FrogPerchDataset
 from frog_perch.models.downstream import build_downstream
 import frog_perch.config as config
 
-def python_gen(dataset_obj):
-    """
-    Generator that yields items from dataset_obj forever (random sampling inside dataset).
-    Each item = (spatial_emb, label, audio_file, start)
-    """
-    while True:
-        item = dataset_obj[np.random.randint(0, len(dataset_obj))]
-        yield item  # (spatial_emb, label, audio_file, start)
+from frog_perch.training.dataset_builders import (
+    build_tf_dataset,
+    build_tf_val_dataset
+)
 
-def build_tf_dataset(dataset_obj, batch_size):
-    # Probe a single element to create correct TensorSpecs
-    sample = dataset_obj[0]
-    spatial_shape = sample[0].shape  # (16,4,1536)
-    label = sample[1]
-    # label shape may be scalar or vector
-    if np.isscalar(label):
-        label_shape = ()
-        label_dtype = np.float32
-    else:
-        label_shape = label.shape
-        label_dtype = np.float32
+from frog_perch.metrics.count_metrics import (
+    ExpectedRecall,
+    ExpectedPrecision,
+    ExpectedBinaryAccuracy,
+    EMD,
+    ExpectedCountMAE
+)
 
-    output_signature = (
-        tf.TensorSpec(shape=spatial_shape, dtype=tf.float32),
-        tf.TensorSpec(shape=label_shape, dtype=label_dtype),
-        tf.TensorSpec(shape=(), dtype=tf.string),
-        tf.TensorSpec(shape=(), dtype=tf.int32),
+
+class GPUMemoryCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        try:
+            info = tf.config.experimental.get_memory_info('GPU:0')
+            used = info['current'] / (1024 ** 2)
+            peak = info['peak'] / (1024 ** 2)
+            print(f"\n[GPU MEMORY] Epoch {epoch+1}: used={used:.0f} MB | peak={peak:.0f} MB")
+        except Exception:
+            # best-effort; don't break training if memory info unavailable
+            pass
+
+def train(
+    label_mode=config.LABEL_MODE,
+    epochs=config.EPOCHS,
+    batch_size=config.BATCH_SIZE,
+    pool_method=getattr(config, "POOL_METHOD", "conv"),
+    val_stride=getattr(config, "VAL_STRIDE_SEC", 1.0),
+    steps_per_epoch=getattr(config, "STEPS_PER_EPOCH", 200),
+    q2_confidence=getattr(config, "Q2_CONFIDENCE", 0.75)
+):
+    """
+    Train downstream model with:
+      - random-crop training (infinite-like via generator)
+      - deterministic stride-based validation (finite)
+    Returns: (model, val_ds)
+    """
+
+    # 1) instantiate dataset objects
+    train_ds_obj = FrogPerchDataset(
+        audio_dir=config.AUDIO_DIR,
+        annotation_dir=config.ANNOTATION_DIR,
+        train=True,
+        pos_ratio=config.POS_RATIO,
+        random_seed=config.RANDOM_SEED,
+        label_mode=label_mode,
+        q2_confidence=q2_confidence
     )
 
-    ds = tf.data.Dataset.from_generator(lambda: python_gen(dataset_obj), output_signature=output_signature)
-    ds = ds.map(lambda s,l,a,b: (s,l), num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds
-
-def train(label_mode=config.LABEL_MODE, epochs=config.EPOCHS, batch_size=config.BATCH_SIZE):
-    # instantiate Python dataset objects for train & val
-    train_ds_obj = FrogPerchDataset(audio_dir=config.AUDIO_DIR, annotation_dir=config.ANNOTATION_DIR,
-                                    train=True, pos_ratio=config.POS_RATIO, random_seed=config.RANDOM_SEED,
-                                    label_mode=label_mode)
-    val_ds_obj = FrogPerchDataset(audio_dir=config.AUDIO_DIR, annotation_dir=config.ANNOTATION_DIR,
-                                  train=False, pos_ratio=config.POS_RATIO, random_seed=config.RANDOM_SEED,
-                                  label_mode=label_mode)
+    val_ds_obj = FrogPerchDataset(
+        audio_dir=config.AUDIO_DIR,
+        annotation_dir=config.ANNOTATION_DIR,
+        train=False,
+        pos_ratio=None,  # no rebalancing for validation
+        random_seed=config.RANDOM_SEED,
+        label_mode=label_mode,
+        val_stride_sec=val_stride,
+        q2_confidence=q2_confidence
+    )
 
     train_ds = build_tf_dataset(train_ds_obj, batch_size=batch_size)
-    val_ds = build_tf_dataset(val_ds_obj, batch_size=batch_size)
+    val_ds = build_tf_val_dataset(val_ds_obj, batch_size=batch_size)
 
-    # model
-    model = build_downstream(spatial_shape=(16,4,1536), label_mode=label_mode, pool_method='conv')
+    # 2) build downstream model
+    model = build_downstream(
+        spatial_shape=(16, 4, 1536),
+        label_mode=label_mode,
+        pool_method=pool_method,
+    )
 
+    # 3) loss & metrics
     if label_mode == 'binary':
         loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-        model.compile(optimizer=tf.keras.optimizers.Adam(config.LEARNING_RATE), loss=loss, metrics=[tf.keras.metrics.BinaryAccuracy()])
-    else:
-        loss = tf.keras.losses.KLDivergence()
-        model.compile(optimizer=tf.keras.optimizers.Adam(config.LEARNING_RATE), loss=loss, metrics=[tf.keras.metrics.CategoricalAccuracy()])
+        metrics = [
+            tf.keras.metrics.BinaryAccuracy(name="acc"),
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+            tf.keras.metrics.MeanSquaredError(name="brier"),
+        ]
 
+    else:
+        # count mode: dataset returns a probability vector (soft counts)
+        # use KLDivergence (you used this earlier) and CategoricalAccuracy
+        loss = tf.keras.losses.KLDivergence()
+        metrics = [
+            ExpectedCountMAE(),
+            EMD(),
+            ExpectedRecall(),
+            ExpectedPrecision(),
+            ExpectedBinaryAccuracy()
+        ]
+
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(config.LEARNING_RATE), loss=loss, metrics=metrics)
+
+    # 4) callbacks
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-    ckpt_path = os.path.join(config.CHECKPOINT_DIR, 'downstream_best.h5')
+    ckpt_path = os.path.join(config.CHECKPOINT_DIR, 'downstream_best.keras')
+
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True),
-        tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
+        tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, verbose=1, restore_best_weights=True),
+        GPUMemoryCallback(),
     ]
 
-    # Steps: tune to size. default values chosen to be conservative.
-    steps_per_epoch = 200
-    validation_steps = 50
+    validation_steps = len(val_ds_obj) // batch_size
 
-    model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks,
-              steps_per_epoch=steps_per_epoch, validation_steps=validation_steps)
-    return model
+    # 5) fit
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        validation_steps=validation_steps,
+        epochs=epochs,
+        callbacks=callbacks,
+        steps_per_epoch=steps_per_epoch,
+    )
+
+    return model, val_ds

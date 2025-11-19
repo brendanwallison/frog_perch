@@ -8,11 +8,20 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 
-from frog_perch.utils.audio import load_audio, resample_array, ensure_length
-from frog_perch.utils.annotations import load_annotations, has_frog_call, get_frog_call_weights, soft_count_distribution
+from frog_perch.utils.audio import load_audio, resample_array
+from frog_perch.utils.annotations import (
+    load_annotations,
+    has_frog_call,
+    get_frog_call_weights,
+    soft_count_distribution
+)
 from frog_perch.models.perch_wrapper import PerchWrapper
 import frog_perch.config as config
 
+
+# =========================================================
+#  RangeSampler (TRAIN-TIME ONLY)
+# =========================================================
 class RangeSampler:
     def __init__(self, ranges):
         self.ranges = ranges
@@ -31,22 +40,39 @@ class RangeSampler:
         for i, cum_size in enumerate(self.cumulative_sizes):
             if idx < cum_size:
                 r = self.ranges[i]
-                prev = self.cumulative_sizes[i-1] if i > 0 else 0
+                prev = self.cumulative_sizes[i - 1] if i > 0 else 0
                 offset = idx - prev
                 return {'audio_file': r['audio_file'], 'start': r['start'] + offset}
 
+
+# =========================================================
+#  FrogPerchDataset
+# =========================================================
 class FrogPerchDataset:
     """
-    Produces (spatial_embedding, label, audio_file, start_sample_original)
-    - Uses coarse positive/negative ranges (RangeSampler) to pick candidate windows.
-    - For each sampled window, extracts a 5s clip (in original-sr samples),
-      resamples to 32k, ensures exact length, calls Perch to get spatial embedding,
-      then computes label using your high-fidelity annotation logic.
+    TRAIN:
+        - Balanced sampling via positive/negative ranges
+        - Random crops
+        - Infinite-like dataset
+
+    VALIDATION:
+        - Deterministic windows with fixed stride
+        - No random cropping
+        - No positive/negative sampling
+        - Fully finite length
     """
 
-    def __init__(self, audio_dir=None, annotation_dir=None, train=True,
-                 test_split=None, pos_ratio=None, random_seed=None,
-                 label_mode='count'):
+    def __init__(self,
+                 audio_dir=None,
+                 annotation_dir=None,
+                 train=True,
+                 test_split=None,
+                 pos_ratio=None,
+                 random_seed=None,
+                 label_mode='count',
+                 val_stride_sec=None, 
+                 q2_confidence=0.75):
+
         self.audio_dir = audio_dir or config.AUDIO_DIR
         self.annotation_dir = annotation_dir or config.ANNOTATION_DIR
         self.train = train
@@ -54,29 +80,47 @@ class FrogPerchDataset:
         self.pos_ratio = pos_ratio if pos_ratio is not None else config.POS_RATIO
         self.random_seed = random_seed if random_seed is not None else config.RANDOM_SEED
         self.label_mode = label_mode
-        self.sample_rate = config.DATASET_SAMPLE_RATE  # used for computing metadata start indices (samples)
-        self.clip_samples = int(config.CLIP_DURATION_SECONDS * self.sample_rate)  # samples at original sr
+        self.val_stride_sec = val_stride_sec or config.VAL_STRIDE_SEC
+        self.q2_confidence = q2_confidence
+
+        # sampling/clip definitions
+        self.sample_rate = config.DATASET_SAMPLE_RATE
+        self.clip_samples = int(config.CLIP_DURATION_SECONDS * self.sample_rate)
         self.perch_sr = config.PERCH_SAMPLE_RATE
         self.perch_samples = config.PERCH_CLIP_SAMPLES
 
         random.seed(self.random_seed)
         np.random.seed(self.random_seed)
 
+        # load train/test split
         self.audio_files = self._load_or_create_split()
-        self.metadata_path = self._get_metadata_path()
-        if os.path.exists(self.metadata_path):
-            self._load_metadata()
+
+        # TRAIN MODE: load or compute metadata
+        if self.train:
+            self.metadata_path = self._get_metadata_path()
+            if os.path.exists(self.metadata_path):
+                self._load_metadata()
+            else:
+                self._compute_and_save_metadata()
+
+            self.pos_sampler = RangeSampler(self.positive_ranges)
+            self.neg_sampler = RangeSampler(self.negative_ranges)
+
+        # VALIDATION MODE: build deterministic index
         else:
-            self._compute_and_save_metadata()
+            self._build_validation_index()
 
-        self.pos_sampler = RangeSampler(self.positive_ranges)
-        self.neg_sampler = RangeSampler(self.negative_ranges)
-
-        # load Perch
+        # load Perch model
         self.perch = PerchWrapper()
 
+    # =========================================================
+    #  Split handling
+    # =========================================================
     def _get_split_path(self):
-        return os.path.join(self.audio_dir, f"dataset_split_seed{self.random_seed}_split{self.test_split}.json")
+        return os.path.join(
+            self.audio_dir,
+            f"dataset_split_seed{self.random_seed}_split{self.test_split}.json"
+        )
 
     def _load_or_create_split(self):
         split_path = self._get_split_path()
@@ -90,8 +134,12 @@ class FrogPerchDataset:
             split = {'train': all_files[:split_idx], 'test': all_files[split_idx:]}
             with open(split_path, 'w') as f:
                 json.dump(split, f)
+
         return split['train'] if self.train else split['test']
 
+    # =========================================================
+    #  Metadata (TRAIN ONLY)
+    # =========================================================
     def _get_metadata_path(self):
         key = "_".join(sorted(self.audio_files))
         split_tag = "train" if self.train else "test"
@@ -101,20 +149,17 @@ class FrogPerchDataset:
     def _load_metadata(self):
         with open(self.metadata_path, 'r') as f:
             metadata = json.load(f)
+
         self.positive_ranges = metadata['positive_ranges']
         self.negative_ranges = metadata['negative_ranges']
         self.audio_files = metadata['audio_files']
-        # sanity check
-        all_audio_files = set(os.listdir(self.audio_dir))
-        missing = set(r['audio_file'] for r in self.positive_ranges + self.negative_ranges if r['audio_file'] not in all_audio_files)
-        if missing:
-            raise FileNotFoundError(f"Metadata references missing files: {sorted(missing)}")
+
         pos_total = sum(r['end'] - r['start'] for r in self.positive_ranges)
         neg_total = sum(r['end'] - r['start'] for r in self.negative_ranges)
-        print(f"[{'TRAIN' if self.train else 'TEST'}] Loaded metadata: {len(self.audio_files)} files; pos {pos_total} neg {neg_total}")
+        print(f"[TRAIN] Loaded metadata: {len(self.audio_files)} files; pos {pos_total} neg {neg_total}")
 
     def _compute_and_save_metadata(self):
-        print("Computing metadata (positive and negative ranges). This may take a while for many files.")
+        print("Computing metadata (positive and negative ranges).")
         self.positive_ranges = []
         self.negative_ranges = []
 
@@ -124,15 +169,15 @@ class FrogPerchDataset:
             try:
                 info = sf.info(audio_path)
                 total_samples = int(info.frames)
-            except Exception as e:
-                print(f"Failed to read {audio_file}: {e}")
+            except:
                 return [], []
+
             all_start = 0
             all_end = max(0, total_samples - self.clip_samples + 1)
             all_indices = set(range(all_start, all_end))
 
             pos_indices = set()
-
+            # derive positive indices
             for _, row in annotations.iterrows():
                 if 'white dot' not in row['Annotation']:
                     continue
@@ -141,14 +186,15 @@ class FrogPerchDataset:
                 ann_duration = ann_end - ann_start
                 if ann_duration <= 0:
                     continue
-                min_overlap = 0.5 * ann_duration
 
+                min_overlap = 0.5 * ann_duration
                 clip_start_min = ann_start + min_overlap - (self.clip_samples / float(self.sample_rate))
                 clip_start_max = ann_end - min_overlap
 
                 start_idx_min = max(0, int(np.floor(clip_start_min * self.sample_rate)))
                 start_idx_max_raw = clip_start_max * self.sample_rate
                 start_idx_max = min(int(np.floor(start_idx_max_raw)), total_samples - self.clip_samples)
+
                 if start_idx_max >= start_idx_min:
                     pos_indices.update(range(start_idx_min, start_idx_max + 1))
 
@@ -165,7 +211,11 @@ class FrogPerchDataset:
                     if s == prev + 1:
                         prev = s
                     else:
-                        ranges.append({'audio_file': audio_file, 'start': current_start, 'end': prev + 1})
+                        ranges.append({
+                            'audio_file': audio_file,
+                            'start': current_start,
+                            'end': prev + 1
+                        })
                         current_start = s
                         prev = s
                 ranges.append({'audio_file': audio_file, 'start': current_start, 'end': prev + 1})
@@ -173,83 +223,135 @@ class FrogPerchDataset:
 
             return to_ranges(pos_indices), to_ranges(neg_indices)
 
-        with ThreadPoolExecutor(max_workers=config.METADATA_WORKERS) as executor:
-            results = list(executor.map(process_file, self.audio_files))
+        with ThreadPoolExecutor(max_workers=config.METADATA_WORKERS) as ex:
+            results = list(ex.map(process_file, self.audio_files))
 
         for pos, neg in results:
             self.positive_ranges.extend(pos)
             self.negative_ranges.extend(neg)
 
-        metadata = {'positive_ranges': self.positive_ranges, 'negative_ranges': self.negative_ranges, 'audio_files': self.audio_files}
+        metadata = {
+            'positive_ranges': self.positive_ranges,
+            'negative_ranges': self.negative_ranges,
+            'audio_files': self.audio_files
+        }
         with open(self.metadata_path, 'w') as f:
             json.dump(metadata, f)
 
         pos_total = sum(r['end'] - r['start'] for r in self.positive_ranges)
         neg_total = sum(r['end'] - r['start'] for r in self.negative_ranges)
-        print(f"[{'TRAIN' if self.train else 'TEST'}] Computed metadata for {len(self.audio_files)} files: pos {pos_total}, neg {neg_total}")
+        print(f"[TRAIN] Computed metadata: pos {pos_total}, neg {neg_total}")
 
+    # =========================================================
+    #  VALIDATION: deterministic fixed-stride index
+    # =========================================================
+    def _build_validation_index(self):
+        print("[VAL] Building deterministic validation windows...")
+        self.val_index = []
+
+        for audio_file in self.audio_files:
+            audio_path = os.path.join(self.audio_dir, audio_file)
+            try:
+                info = sf.info(audio_path)
+                total_samples = int(info.frames)
+            except:
+                continue
+
+            total_seconds = total_samples / float(self.sample_rate)
+            clip_seconds = self.clip_samples / float(self.sample_rate)
+
+            # deterministic evenly spaced windows
+            starts_sec = np.arange(
+                0,
+                max(0, total_seconds - clip_seconds),
+                self.val_stride_sec
+            )
+
+            for s in starts_sec:
+                self.val_index.append((audio_file, float(s)))
+
+        print(f"[VAL] Total validation windows: {len(self.val_index)}")
+
+    # =========================================================
+    #  Dataset length
+    # =========================================================
     def __len__(self):
-        # you used 1000 as a returned length in PyTorch; keep similar infinite-ish sampling
-        return 1000
+        if self.train:
+            return 1000  # infinite-like
+        else:
+            return len(self.val_index)
 
-    def true_length(self):
-        return self.pos_sampler.total + self.neg_sampler.total
-
-    def _sample_entry(self):
+    # =========================================================
+    #  TRAINING sampling (random balanced)
+    # =========================================================
+    def _sample_entry_train(self):
         if self.pos_sampler.total == 0 and self.neg_sampler.total == 0:
             raise RuntimeError("No clips available for sampling.")
+
         use_pos = (random.random() < self.pos_ratio) and (self.pos_sampler.total > 0)
         entry = self.pos_sampler.sample() if use_pos else self.neg_sampler.sample()
-        return entry, use_pos
+        return entry
 
+    # =========================================================
+    #  __getitem__
+    # =========================================================
     def __getitem__(self, idx):
-        """
-        Returns:
-            spatial_emb (np.float32) shape (16,4,1536)
-            label: float or np.array(shape=(5,)) depending on label_mode
-            audio_file: str
-            start: int (start sample index at original sample_rate)
-        """
-        entry, _ = self._sample_entry()
-        audio_file = entry['audio_file']
-        start_sample = int(entry['start'])  # sample index at self.sample_rate (likely 16k)
-        audio_path = os.path.join(self.audio_dir, audio_file)
+        # -----------------------------
+        # TRAINING: random sampling
+        # -----------------------------
+        if self.train:
+            entry = self._sample_entry_train()
+            audio_file = entry['audio_file']
+            start_sample = int(entry['start'])
 
-        # Load original audio at dataset sample rate and slice clip
-        # load_audio will resample if target_sr provided; we want original sr here
+        # -----------------------------
+        # VALIDATION: fixed stride windows
+        # -----------------------------
+        else:
+            audio_file, start_sec = self.val_index[idx]
+            start_sample = int(round(start_sec * self.sample_rate))
+
+        # load audio
+        audio_path = os.path.join(self.audio_dir, audio_file)
         data, sr = load_audio(audio_path, target_sr=self.sample_rate)
-        # slice clip at original sr
+
+        # deterministic slicing (no randomness in val)
         end = start_sample + self.clip_samples
-        if start_sample < 0:
-            start_sample = 0
         if end <= len(data):
             clip = data[start_sample:end]
         else:
             clip = np.zeros(self.clip_samples, dtype=np.float32)
             valid = max(0, len(data) - start_sample)
             if valid > 0:
-                clip[:valid] = data[start_sample:start_sample+valid]
+                clip[:valid] = data[start_sample:start_sample + valid]
 
-        # Convert clip (original sr) -> Perch sr
+        # convert to Perch sample rate
         clip_perch = resample_array(clip, orig_sr=self.sample_rate, target_sr=self.perch_sr)
-        clip_perch = ensure_length(clip_perch, self.perch_samples, random_crop=True)
 
-        # compute label using high-fidelity logic (times in seconds)
+        # Training: no random cropping needed; just pad if slightly short from resampling
+        if len(clip_perch) < self.perch_samples:
+            clip_perch = np.pad(clip_perch, (0, self.perch_samples - len(clip_perch)))
+
+        # Sanity crop if resampler produces +1 sample due to rounding
+        clip_perch = clip_perch[:self.perch_samples]
+
+        # compute label
         clip_start_time = start_sample / float(self.sample_rate)
         clip_end_time = clip_start_time + (self.clip_samples / float(self.sample_rate))
-
         annotations = load_annotations(self.annotation_dir, audio_file)
 
         if self.label_mode == 'binary':
-            label_value = has_frog_call(annotations, clip_start_time, clip_end_time)
+            label_value = has_frog_call(annotations, clip_start_time, clip_end_time, q2_confidence=self.q2_confidence)
             label = float(label_value)
+
         elif self.label_mode == 'count':
-            weights = get_frog_call_weights(annotations, clip_start_time, clip_end_time)
+            weights = get_frog_call_weights(annotations, clip_start_time, clip_end_time, q2_confidence=self.q2_confidence)
             label = soft_count_distribution(weights)
+
         else:
             raise ValueError(f"Unknown label_mode: {self.label_mode}")
 
-        # Perch: get spatial embedding for this clip (numpy array)
-        spatial_emb = self.perch.get_spatial_embedding(clip_perch)
-        spatial_emb = spatial_emb.astype(np.float32)
+        # get Perch embedding
+        spatial_emb = self.perch.get_spatial_embedding(clip_perch).astype(np.float32)
+
         return spatial_emb, label, audio_file, start_sample

@@ -1,63 +1,119 @@
-# diag_perch.py
-import os, sys
-# Must set before importing tf — but here we want to print current env too
-print("ENV TF_XLA_FLAGS:", os.environ.get("TF_XLA_FLAGS"))
-print("ENV XLA_FLAGS:", os.environ.get("XLA_FLAGS"))
-print("ENV TF_ENABLE_ONEDNN_OPTS:", os.environ.get("TF_ENABLE_ONEDNN_OPTS"))
-print("ENV TF_CPP_MIN_LOG_LEVEL:", os.environ.get("TF_CPP_MIN_LOG_LEVEL"))
-
-# Import tensorflow after printing env
-import tensorflow as tf
+# diag_perch.py (WSL-aware)
+import os, sys, platform
 from pathlib import Path
-from frog_perch.utils.download_perch import get_perch_savedmodel_path
+
+# --- WSL / environment diagnostics ---
+print("=== Environment Diagnostics ===")
+print("Platform:", platform.platform())
+print("System:", platform.system(), "| Release:", platform.release())
+print("Python executable:", sys.executable)
+print("PWD:", os.getcwd())
+
+# Detect if running inside WSL
+is_wsl = "microsoft" in platform.release().lower()
+print("Running inside WSL:", is_wsl)
+
+# Warn if running on Windows paths inside WSL (slow, breaks hardlinks)
+cwd_path = Path(os.getcwd())
+if str(cwd_path).startswith("/mnt/"):
+    print("WARNING: You are inside a Windows-mounted filesystem (/mnt/*).")
+    print("         This causes slow I/O, broken hardlinks, and TF issues.")
+    print("         Move project to your WSL home: ~/dev/frog_perch")
+print()
+
+# --- Print TensorFlow-relevant env vars BEFORE importing TF ---
+print("=== TF Environment Variables ===")
+for var in [
+    "TF_XLA_FLAGS",
+    "XLA_FLAGS",
+    "TF_ENABLE_ONEDNN_OPTS",
+    "TF_CPP_MIN_LOG_LEVEL",
+]:
+    print(f"{var}: {os.environ.get(var)}")
+print()
+
+# --- Import TensorFlow ---
+print("=== TensorFlow Diagnostics ===")
+import tensorflow as tf
 
 print("TF version:", tf.__version__)
-print("tf.test.is_built_with_cuda():", tf.test.is_built_with_cuda())
-print("Physical GPUs:", tf.config.list_physical_devices("GPU"))
+print("Is built with CUDA:", tf.test.is_built_with_cuda())
 
-# Where is the cached Perch savedmodel?
+# List all visible GPU devices
+gpus = tf.config.list_physical_devices("GPU")
+print("Visible GPU devices:", gpus)
+
+# WSL-GPU specific GPU check
+try:
+    import subprocess
+    r = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
+    if r.returncode == 0:
+        print("nvidia-smi: GPU detected under WSL")
+    else:
+        print("nvidia-smi not available (no NVIDIA GPU or no WSLg CUDA support)")
+except FileNotFoundError:
+    print("nvidia-smi command not found (likely CPU-only WSL)")
+print()
+
+# --- Perch SavedModel path ---
+print("=== Perch SavedModel Diagnostics ===")
+from frog_perch.utils.download_perch import get_perch_savedmodel_path
+
 sm = Path(get_perch_savedmodel_path())
 print("Perch SavedModel directory:", sm)
-print("Contains:", [p.name for p in sm.iterdir()])
 
-# Try to list saved_model.pb location(s)
+if not sm.exists():
+    print("ERROR: SavedModel directory does not exist!")
+else:
+    print("Directory contents:", [p.name for p in sm.iterdir()])
+
 pb_files = list(sm.glob("**/saved_model.pb"))
-print("saved_model.pb instances:", [str(p) for p in pb_files])
+print("Found saved_model.pb:", [str(p) for p in pb_files])
+print()
 
-# Try to load model (wrapped try/except)
+# --- Attempt loading the SavedModel ---
+print("=== Testing TF SavedModel Load ===")
+
+# Disable JIT / MLIR for safety on WSL CPU-only
 try:
-    # Try disabling jit at runtime (best-effort)
-    try:
-        tf.config.optimizer.set_jit(False)
-    except Exception:
-        pass
-    try:
-        tf.config.experimental.disable_mlir_bridge()
-    except Exception:
-        pass
+    tf.config.optimizer.set_jit(False)
+except Exception:
+    pass
 
-    print("Attempting to load SavedModel (this may error)...")
+try:
+    tf.config.experimental.disable_mlir_bridge()
+except Exception:
+    pass
+
+try:
+    print("Loading SavedModel...")
     model = tf.saved_model.load(str(sm))
-    print("Loaded OK. signatures:", list(model.signatures.keys()) if hasattr(model, "signatures") else "no signatures")
-    # If signatures exist, call serving_default with dummy input shape if possible
-    if hasattr(model, "signatures") and "serving_default" in model.signatures:
-        sig = model.signatures["serving_default"]
-        print("serving_default inputs:", sig.structured_input_signature)
-        # Prepare a zero waveform of expected length if possible (don't crash)
-        # Try to find a numeric input shape
-        import numpy as np
-        # Heuristic: take first input and try shape e.g. [1,160000]
-        inputs = list(sig.structured_input_signature[1].items())
-        if inputs:
-            name, spec = inputs[0]
-            print("First input name:", name, "spec:", spec)
-            # Attempt to create zeros for common shapes
-            try:
-                dummy = np.zeros((1, 160000), dtype=np.float32)
-                out = sig(**{name: tf.convert_to_tensor(dummy)})
-                print("serving_default call keys:", list(out.keys()) if isinstance(out, dict) else "tensor")
-            except Exception as e:
-                print("Calling serving_default failed:", e)
+    print("Loaded successfully.")
+
+    if hasattr(model, "signatures"):
+        sigs = list(model.signatures.keys())
+        print("Signatures:", sigs)
+
+        if "serving_default" in model.signatures:
+            sig = model.signatures["serving_default"]
+            print("serving_default input signature:", sig.structured_input_signature)
+
+            # Prepare dummy input if possible
+            import numpy as np
+
+            inputs = list(sig.structured_input_signature[1].items())
+            if inputs:
+                name, spec = inputs[0]
+                print("Trying dummy input for:", name)
+
+                try:
+                    dummy = np.zeros((1, 160000), dtype=np.float32)
+                    out = sig(**{name: tf.convert_to_tensor(dummy)})
+                    print("serving_default call output keys:",
+                          list(out.keys()) if isinstance(out, dict) else "tensor")
+                except Exception as e:
+                    print("Dummy call failed:", e)
+
 except Exception as e:
     print("Failed to load Perch SavedModel:", repr(e))
     sys.exit(1)

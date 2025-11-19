@@ -44,7 +44,8 @@ class PerchWrapper:
         else:
             return self.model(t)
 
-    def get_spatial_embedding(self, waveform):
+    # ---------- shared helper ----------
+    def _get_output(self, waveform, key):
         single = False
         if waveform.ndim == 1:
             waveform = waveform[None, :]
@@ -55,10 +56,15 @@ class PerchWrapper:
         if not isinstance(out, dict):
             raise RuntimeError("Expected dict of outputs from Perch SavedModel.")
 
-        # Find the spatial key
-        for k in out.keys():
-            if "spatial" in k.lower():
-                arr = out[k].numpy()
-                return arr[0] if single else arr
+        if key not in out:
+            raise RuntimeError(f"Key '{key}' not found in outputs: {list(out.keys())}")
 
-        raise RuntimeError(f"No spatial embedding key in outputs: {list(out.keys())}")
+        arr = out[key].numpy()
+        return arr[0] if single else arr
+
+    # ---------- public API ----------
+    def get_spatial_embedding(self, waveform):
+        return self._get_output(waveform, "spatial_embedding")
+
+    def get_embedding(self, waveform):
+        return self._get_output(waveform, "embedding")
