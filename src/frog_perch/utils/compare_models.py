@@ -7,11 +7,11 @@ import os
 from datetime import datetime
 
 POOL_METHODS = [
+    'mlp_flat',
     'bottleneck1x1',
     'attn',
     'conv',
     'mean',
-    'mlp_flat',
     'conv2'
 ]
 

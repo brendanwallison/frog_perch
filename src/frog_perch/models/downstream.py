@@ -3,6 +3,73 @@ import tensorflow as tf
 from keras import layers, Model
 import keras.ops as ops
 
+class MultiheadAttentionPool2D(layers.Layer):
+    """
+    Spatial Q/K/V self-attention + pooling.
+    Uses a CLS-style learnable token to produce a pooled representation.
+    """
+
+    def __init__(self, num_heads=4, key_dim=64, **kwargs):
+        super().__init__(**kwargs)
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+
+        # Built-in TF attention
+        self.mha = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=key_dim,
+            dropout=0.0
+        )
+
+    def build(self, input_shape):
+        _, H, W, C = input_shape
+
+        # CLS token: a learned vector the model can attend to
+        self.cls_token = self.add_weight(
+            shape=(1, 1, C),
+            initializer="zeros",
+            trainable=True,
+            name="cls_token"
+        )
+
+    def call(self, x):
+        B = ops.shape(x)[0]
+        H = ops.shape(x)[1]
+        W = ops.shape(x)[2]
+        C = ops.shape(x)[3]
+
+        # Flatten spatial dims: [B, H*W, C]
+        x_flat = ops.reshape(x, (B, H * W, C))
+
+        # Expand CLS token across the batch
+        cls = ops.broadcast_to(self.cls_token, (B, 1, C))
+
+        # Prepend CLS token: [B, 1 + H*W, C]
+        x_in = ops.concatenate([cls, x_flat], axis=1)
+
+        # MHA self-attention
+        attended = self.mha(
+            query=x_in, value=x_in, key=x_in,
+            training=self.trainable
+        )  # shape: [B, 1+HW, C]
+
+        # The output for the CLS vector is the pooled embedding
+        pooled = attended[:, 0, :]   # [B, C]
+
+        return pooled
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[-1])
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+        })
+        return cfg
+
+
 class AttentionPool2D(layers.Layer):
     """
     Lightweight spatial attention:
@@ -128,6 +195,13 @@ def build_downstream(
         x = tf.reduce_mean(x, axis=2)                     # [B,H,C]
         x = layers.Flatten()(x)
         x = layers.Dense(512, activation='relu')(x)
+
+    ## ---------------------------------------------------------
+    ## 10. True Multihead Attention
+    ## ---------------------------------------------------------
+    elif pool_method == 'mha':
+        x = MultiheadAttentionPool2D(num_heads=4, key_dim=128)(x)
+
 
     ## ---------------------------------------------------------
     ## Unknown option

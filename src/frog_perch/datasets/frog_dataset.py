@@ -63,15 +63,18 @@ class FrogPerchDataset:
     """
 
     def __init__(self,
-                 audio_dir=None,
-                 annotation_dir=None,
-                 train=True,
-                 test_split=None,
-                 pos_ratio=None,
-                 random_seed=None,
-                 label_mode='count',
-                 val_stride_sec=None, 
-                 q2_confidence=0.75):
+                audio_dir=None,
+                annotation_dir=None,
+                train=True,
+                test_split=None,
+                pos_ratio=None,
+                random_seed=None,
+                label_mode='count',
+                val_stride_sec=None,
+                q2_confidence=0.75,
+                equalize_q2_val=False,
+                use_continuous_confidence=False,
+                confidence_params=None):
 
         self.audio_dir = audio_dir or config.AUDIO_DIR
         self.annotation_dir = annotation_dir or config.ANNOTATION_DIR
@@ -82,6 +85,15 @@ class FrogPerchDataset:
         self.label_mode = label_mode
         self.val_stride_sec = val_stride_sec or config.VAL_STRIDE_SEC
         self.q2_confidence = q2_confidence
+        self.equalize_q2_val = equalize_q2_val
+        self.use_continuous_confidence = use_continuous_confidence
+        # Guarantee it's a dictionary
+        if confidence_params is None:
+            confidence_params = {}
+
+        self.duration_stats  = confidence_params.get("duration_stats", None)
+        self.bandwidth_stats = confidence_params.get("bandwidth_stats", None)
+        self.logistic_params = confidence_params.get("logistic_params", None)
 
         # sampling/clip definitions
         self.sample_rate = config.DATASET_SAMPLE_RATE
@@ -109,6 +121,8 @@ class FrogPerchDataset:
         # VALIDATION MODE: build deterministic index
         else:
             self._build_validation_index()
+            if self.equalize_q2_val:
+                self.q2_confidence = 1.0
 
         # load Perch model
         self.perch = PerchWrapper()
@@ -123,19 +137,87 @@ class FrogPerchDataset:
         )
 
     def _load_or_create_split(self):
+        """
+        Modified split logic:
+        - Parse each filename of the form:
+            P4__20241113_170000_SYNC_clip12.wav
+        - Extract the date/hour key: "20241113_170000"
+        - Group all files by this date/hour key across microphones.
+        - Perform train/test split at the DATE-HOUR GROUP level,
+        ensuring *no leakage across microphones or clips*.
+        """
         split_path = self._get_split_path()
         if os.path.exists(split_path):
             with open(split_path, 'r') as f:
                 split = json.load(f)
-        else:
-            all_files = [f for f in os.listdir(self.audio_dir) if f.endswith('.wav')]
-            random.shuffle(all_files)
-            split_idx = int(len(all_files) * (1 - self.test_split))
-            split = {'train': all_files[:split_idx], 'test': all_files[split_idx:]}
-            with open(split_path, 'w') as f:
-                json.dump(split, f)
+            return split['train'] if self.train else split['test']
 
+        # ------------------------------------------------------
+        # 1. Collect *.wav files
+        # ------------------------------------------------------
+        all_files = [f for f in os.listdir(self.audio_dir) if f.endswith('.wav')]
+
+        # ------------------------------------------------------
+        # 2. Group files by date_hour (YYYYMMDD_HHMMSS)
+        # ------------------------------------------------------
+        groups = {}   # key: date_hour, value: list of audio files
+        for fname in all_files:
+            # Expect: P4__20241113_170000_SYNC_clip12.wav
+            parts = fname.split("__")
+            if len(parts) < 2:
+                # If weird filename, put in its own group for safety
+                date_hour = "ungrouped_" + fname
+            else:
+                after_mic = parts[1]            # "20241113_170000_SYNC_clip12.wav"
+                date_hour = after_mic.split("_")[0] + "_" + after_mic.split("_")[1]
+                # yields "20241113_170000"
+
+            groups.setdefault(date_hour, []).append(fname)
+
+        date_hour_keys = sorted(groups.keys())
+        random.shuffle(date_hour_keys)
+
+        # ------------------------------------------------------
+        # 3. Split at the group level
+        # ------------------------------------------------------
+        split_idx = int(len(date_hour_keys) * (1 - self.test_split))
+        train_groups = date_hour_keys[:split_idx]
+        test_groups  = date_hour_keys[split_idx:]
+
+        train_files = []
+        test_files = []
+        for k in train_groups:
+            train_files.extend(groups[k])
+        for k in test_groups:
+            test_files.extend(groups[k])
+
+        # ------------------------------------------------------
+        # 4. Save split structure
+        # ------------------------------------------------------
+        split = {'train': sorted(train_files), 'test': sorted(test_files)}
+        with open(split_path, 'w') as f:
+            json.dump(split, f, indent=2)
+
+        # ------------------------------------------------------
+        # 5. Return
+        # ------------------------------------------------------
         return split['train'] if self.train else split['test']
+
+
+    # def _load_or_create_split(self):
+    #     split_path = self._get_split_path()
+    #     if os.path.exists(split_path):
+    #         with open(split_path, 'r') as f:
+    #             split = json.load(f)
+    #     else:
+    #         all_files = [f for f in os.listdir(self.audio_dir) if f.endswith('.wav')]
+    #         random.shuffle(all_files)
+    #         split_idx = int(len(all_files) * (1 - self.test_split))
+    #         split = {'train': all_files[:split_idx], 'test': all_files[split_idx:]}
+    #         with open(split_path, 'w') as f:
+    #             json.dump(split, f)
+
+    #     return split['train'] if self.train else split['test']
 
     # =========================================================
     #  Metadata (TRAIN ONLY)
@@ -341,11 +423,29 @@ class FrogPerchDataset:
         annotations = load_annotations(self.annotation_dir, audio_file)
 
         if self.label_mode == 'binary':
-            label_value = has_frog_call(annotations, clip_start_time, clip_end_time, q2_confidence=self.q2_confidence)
-            label = float(label_value)
+            label_value = has_frog_call(
+                annotations,
+                clip_start_time,
+                clip_end_time,
+                q2_confidence=self.q2_confidence,
+                use_continuous_confidence=self.use_continuous_confidence,
+                duration_stats=self.duration_stats,
+                bandwidth_stats=self.bandwidth_stats,
+                logistic_params=self.logistic_params
+            )
+            # label = float(label_value)
 
         elif self.label_mode == 'count':
-            weights = get_frog_call_weights(annotations, clip_start_time, clip_end_time, q2_confidence=self.q2_confidence)
+            weights = get_frog_call_weights(
+                annotations,
+                clip_start_time,
+                clip_end_time,
+                q2_confidence=self.q2_confidence,
+                use_continuous_confidence=self.use_continuous_confidence,
+                duration_stats=self.duration_stats,
+                bandwidth_stats=self.bandwidth_stats,
+                logistic_params=self.logistic_params
+            )
             label = soft_count_distribution(weights)
 
         else:

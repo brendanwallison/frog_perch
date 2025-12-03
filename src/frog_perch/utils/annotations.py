@@ -3,11 +3,69 @@ import pandas as pd
 import numpy as np
 from typing import List
 
+# ================================================================
+#  Robust z-score + logistic confidence (unchanged)
+# ================================================================
+
+# def robust_zscore(x, median=None, mad=None, clip=5.0):
+#     x = np.asarray(x, dtype=np.float32)
+#     if median is None:
+#         median = np.median(x)
+#     if mad is None:
+#         mad = np.median(np.abs(x - median))
+#     sigma = max(1e-6, 1.4826 * mad)
+#     z = (x - median) / sigma
+#     if clip is not None:
+#         z = np.clip(z, -clip, clip)
+#     return z, median, mad
+
+
+def logistic_confidence(mean_z,
+                        k=1.0,
+                        x0=0.0,
+                        lower=0.01,
+                        upper=0.99):
+    sigmoid = 1.0 / (1.0 + np.exp(-k * (mean_z - x0)))
+    conf = lower + (upper - lower) * sigmoid
+    return float(np.clip(conf, lower, upper))
+
+
+def annotation_confidence_from_features(duration,
+                                        bandwidth,
+                                        duration_stats=None,
+                                        bandwidth_stats=None,
+                                        combine='mean',
+                                        k=1.0, x0=0.0,
+                                        lower=0.01, upper=0.99,
+                                        clip_z=5.0):
+    if duration_stats is None or bandwidth_stats is None:
+        raise ValueError("Pass precomputed duration_stats and bandwidth_stats (mean, std).")
+
+    d_mean = duration_stats["mean"]
+    d_std = duration_stats["std"]
+    b_mean = bandwidth_stats["mean"]
+    b_std = bandwidth_stats["std"]
+
+    z_d = (float(duration) - d_mean) / max(1e-6, d_std)
+    z_b = (float(bandwidth) - b_mean) / max(1e-6, b_std)
+
+    z_d = float(np.clip(z_d, -clip_z, clip_z))
+    z_b = float(np.clip(z_b, -clip_z, clip_z))
+
+    if isinstance(combine, (list, tuple)) and len(combine) == 2:
+        w1, w2 = combine
+        mean_z = w1 * z_d + w2 * z_b
+    else:
+        mean_z = 0.5 * (z_d + z_b)
+
+    return logistic_confidence(mean_z, k=k, x0=x0, lower=lower, upper=upper)
+
+
+# ================================================================
+#  Annotation loading
+# ================================================================
+
 def load_annotations(annotation_dir, audio_file):
-    """
-    Return DataFrame with columns ['Annotation', 'Begin Time (s)', 'End Time (s)'].
-    If annotation file missing, return empty DataFrame (meaning no calls).
-    """
     base = os.path.splitext(audio_file)[0]
     ann_filename = f"{base}.Table.1.selections.txt"
     ann_path = os.path.join(annotation_dir, ann_filename)
@@ -18,17 +76,71 @@ def load_annotations(annotation_dir, audio_file):
     return df
 
 
-def has_frog_call(annotations, clip_start, clip_end, q2_confidence: float = 0.75):
-    """
-    Return max(overlap_fraction * confidence) across annotations.
+# ================================================================
+#  NEW: Shared confidence handler
+# ================================================================
 
-    q2_confidence: value to use when annotation text contains 'q2'.
-                   Default maintains original behavior (0.75).
+def compute_annotation_confidence(
+    row,
+    q2_confidence: float = 0.75,
+    use_continuous_confidence: bool = False,
+    duration_stats=None,
+    bandwidth_stats=None,
+    logistic_params: dict = None,
+):
+    """
+    Compute confidence for a single annotation row.
+
+    If use_continuous_confidence=False:
+        Uses Q2 hardcoded penalty (original behavior).
+    If True:
+        Uses logistic function with duration/bandwidth features.
+    """
+    ann_text = str(row.get('Annotation', '')).lower()
+
+    if not use_continuous_confidence:
+        # original "q2 or full confidence"
+        return q2_confidence if 'q2' in ann_text else 1.0
+
+    # --- continuous mode ---
+    logistic_params = logistic_params or {}
+
+    duration = float(row.get('End Time (s)', 0.0)) - float(row.get('Begin Time (s)', 0.0))
+    try:
+        bandwidth = float(row.get('Bandwidth (Hz)', 0.0))
+    except Exception:
+        bandwidth = 0.0
+
+    return annotation_confidence_from_features(
+        duration=duration,
+        bandwidth=bandwidth,
+        duration_stats=duration_stats,
+        bandwidth_stats=bandwidth_stats,
+        **logistic_params
+    )
+
+
+# ================================================================
+#  has_frog_call (DRY)
+# ================================================================
+
+def has_frog_call(
+    annotations,
+    clip_start,
+    clip_end,
+    q2_confidence: float = 0.75,
+    use_continuous_confidence: bool = False,
+    duration_stats=None,
+    bandwidth_stats=None,
+    logistic_params: dict = None,
+):
+    """
+    Return max(overlap_fraction * confidence) over annotations.
     """
     max_score = 0.0
 
     for _, row in annotations.iterrows():
-        if 'white dot' not in row['Annotation']:
+        if 'white' not in str(row.get('Annotation', '')).lower():
             continue
 
         ann_start = float(row['Begin Time (s)'])
@@ -37,17 +149,22 @@ def has_frog_call(annotations, clip_start, clip_end, q2_confidence: float = 0.75
         if duration <= 0:
             continue
 
-        # Compute overlap between annotation and clip
         overlap_start = max(clip_start, ann_start)
-        overlap_end = min(clip_end, ann_end)
+        overlap_end   = min(clip_end, ann_end)
         overlap = overlap_end - overlap_start
         if overlap <= 0:
             continue
 
         fraction = overlap / duration
 
-        # Quality-dependent confidence
-        confidence = q2_confidence if 'q2' in row['Annotation'] else 1.0
+        confidence = compute_annotation_confidence(
+            row=row,
+            q2_confidence=q2_confidence,
+            use_continuous_confidence=use_continuous_confidence,
+            duration_stats=duration_stats,
+            bandwidth_stats=bandwidth_stats,
+            logistic_params=logistic_params,
+        )
 
         score = fraction * confidence
         max_score = max(max_score, score)
@@ -55,21 +172,24 @@ def has_frog_call(annotations, clip_start, clip_end, q2_confidence: float = 0.75
     return max_score
 
 
+# ================================================================
+#  get_frog_call_weights (DRY)
+# ================================================================
+
 def get_frog_call_weights(
     annotations,
     clip_start: float,
     clip_end: float,
-    q2_confidence: float = 0.75
+    q2_confidence: float = 0.75,
+    use_continuous_confidence: bool = False,
+    duration_stats=None,
+    bandwidth_stats=None,
+    logistic_params: dict = None,
 ) -> List[float]:
-    """
-    Compute list of weights in [0,1] for overlapping annotations.
-
-    q2_confidence: weight applied to 'q2' annotations.
-    """
     weights = []
 
     clip_start = float(clip_start)
-    clip_end = float(clip_end)
+    clip_end   = float(clip_end)
     if clip_end <= clip_start:
         return weights
 
@@ -80,7 +200,7 @@ def get_frog_call_weights(
 
         try:
             ann_start = float(row['Begin Time (s)'])
-            ann_end = float(row['End Time (s)'])
+            ann_end   = float(row['End Time (s)'])
         except Exception:
             continue
 
@@ -89,18 +209,24 @@ def get_frog_call_weights(
             continue
 
         overlap_start = max(clip_start, ann_start)
-        overlap_end = min(clip_end, ann_end)
+        overlap_end   = min(clip_end, ann_end)
         overlap = overlap_end - overlap_start
         if overlap <= 0:
             continue
 
         fraction = overlap / duration
 
-        # Quality-dependent confidence
-        confidence = q2_confidence if 'q2' in ann_text else 1.0
+        confidence = compute_annotation_confidence(
+            row=row,
+            q2_confidence=q2_confidence,
+            use_continuous_confidence=use_continuous_confidence,
+            duration_stats=duration_stats,
+            bandwidth_stats=bandwidth_stats,
+            logistic_params=logistic_params,
+        )
 
         weight = fraction * confidence
-        weight = max(0.0, min(1.0, float(weight)))
+        weight = float(np.clip(weight, 0.0, 1.0))
 
         if weight > 0.0:
             weights.append(weight)
@@ -108,10 +234,11 @@ def get_frog_call_weights(
     return weights
 
 
+# ================================================================
+#  soft_count_distribution (unchanged)
+# ================================================================
+
 def soft_count_distribution(weights: List[float], max_bin: int = 4) -> np.ndarray:
-    """
-    Compute soft distribution over counts (0..max_bin).
-    """
     max_bin = int(max_bin)
     assert max_bin >= 0
 
@@ -121,12 +248,11 @@ def soft_count_distribution(weights: List[float], max_bin: int = 4) -> np.ndarra
         return dist
 
     probs = np.array(weights, dtype=np.float32)
-
     dist = np.zeros(max_bin + 1, dtype=np.float32)
     dist[0] = 1.0
 
     for p in probs:
-        p = float(max(0.0, min(1.0, p)))
+        p = float(np.clip(p, 0.0, 1.0))
         if p == 0.0:
             continue
         if p == 1.0:
@@ -144,7 +270,7 @@ def soft_count_distribution(weights: List[float], max_bin: int = 4) -> np.ndarra
 
     s = float(dist.sum())
     if s > 0:
-        dist = dist / s
+        dist /= s
     else:
         dist[:] = 0
         dist[0] = 1.0
