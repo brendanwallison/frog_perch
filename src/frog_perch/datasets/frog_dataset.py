@@ -13,7 +13,8 @@ from frog_perch.utils.annotations import (
     load_annotations,
     has_frog_call,
     get_frog_call_weights,
-    soft_count_distribution
+    soft_count_distribution,
+    slice_binary_confidences
 )
 from frog_perch.models.perch_wrapper import PerchWrapper
 import frog_perch.config as config
@@ -82,11 +83,12 @@ class FrogPerchDataset:
         self.test_split = test_split if test_split is not None else config.TEST_SPLIT
         self.pos_ratio = pos_ratio if pos_ratio is not None else config.POS_RATIO
         self.random_seed = random_seed if random_seed is not None else config.RANDOM_SEED
-        self.label_mode = label_mode
         self.val_stride_sec = val_stride_sec or config.VAL_STRIDE_SEC
         self.q2_confidence = q2_confidence
         self.equalize_q2_val = equalize_q2_val
         self.use_continuous_confidence = use_continuous_confidence
+        self.label_mode=label_mode
+
         # Guarantee it's a dictionary
         if confidence_params is None:
             confidence_params = {}
@@ -423,7 +425,7 @@ class FrogPerchDataset:
         annotations = load_annotations(self.annotation_dir, audio_file)
 
         if self.label_mode == 'binary':
-            label_value = has_frog_call(
+            label = has_frog_call(
                 annotations,
                 clip_start_time,
                 clip_end_time,
@@ -447,6 +449,19 @@ class FrogPerchDataset:
                 logistic_params=self.logistic_params
             )
             label = soft_count_distribution(weights)
+
+        elif self.label_mode == 'slice':
+            label = slice_binary_confidences(
+                annotations,
+                clip_start_time,
+                clip_end_time,
+                n_slices=16,
+                q2_confidence=self.q2_confidence,
+                use_continuous_confidence=self.use_continuous_confidence,
+                duration_stats=self.duration_stats,
+                bandwidth_stats=self.bandwidth_stats,
+                logistic_params=self.logistic_params
+            )
 
         else:
             raise ValueError(f"Unknown label_mode: {self.label_mode}")

@@ -21,6 +21,16 @@ from frog_perch.metrics.count_metrics import (
     ExpectedCountMAE
 )
 
+from frog_perch.metrics.slice_to_count_metrics import (
+    SliceToCountKLDivergence,
+    SliceExpectedCountMAE,
+    SliceEMD,
+    SliceExpectedRecall,
+    SliceExpectedPrecision,
+    SliceExpectedBinaryAccuracy,
+    SliceLossWithSoftCountKL
+)
+
 class GPUMemoryCallback(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         try:
@@ -108,6 +118,24 @@ def train(
             tf.keras.metrics.Precision(name="precision"),
             tf.keras.metrics.Recall(name="recall"),
             tf.keras.metrics.MeanSquaredError(name="brier"),
+        ]
+
+    elif label_mode == 'slice':
+        # loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        loss = SliceLossWithSoftCountKL(max_bin=4, kl_weight=1.0)
+        metrics = [
+            tf.keras.metrics.BinaryAccuracy(name="slice_acc"),
+            tf.keras.metrics.AUC(name="slice_auc"),
+            tf.keras.metrics.Precision(name="slice_precision"),
+            tf.keras.metrics.Recall(name="slice_recall"),
+
+            # Clip-level metrics derived from slice logits
+            SliceToCountKLDivergence(),
+            SliceExpectedCountMAE(),
+            SliceEMD(),
+            SliceExpectedRecall(),
+            SliceExpectedPrecision(),
+            SliceExpectedBinaryAccuracy(),
         ]
 
     else:

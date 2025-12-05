@@ -23,9 +23,9 @@ METADATA_WORKERS = 8  # threads for metadata creation
 
 # Training defaults
 BATCH_SIZE = 16
-EPOCHS = 10
+EPOCHS = 20
 LEARNING_RATE = 1e-5
-LABEL_MODE = 'count'  # 'binary' or 'count'
+LABEL_MODE = 'slice'  # 'binary' or 'count'
 STEPS_PER_EPOCH = 250
 
 # Validation defaults
@@ -38,7 +38,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # Downstream model pooling method
 # Options: 'mean','conv','avgmax','mlp_flat','attn','conv2','bottleneck1x1','temporal','freq'
-POOL_METHOD = 'mlp_flat'
+POOL_METHOD = 'slice'
 
 
 # ============================================================

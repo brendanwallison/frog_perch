@@ -6,7 +6,7 @@ def main():
     ds = FrogPerchDataset(
         train=False,
         val_stride_sec=5.0,
-        label_mode="count",
+        label_mode="slice",
         audio_dir="/home/breallis/datasets/frog_calls/round_2",
         annotation_dir="/home/breallis/datasets/frog_calls/round_2",
         equalize_q2_val=True,
@@ -14,8 +14,8 @@ def main():
 
     print("Dataset length:", len(ds))
 
-    # Load item 10
-    x, y, audio_file, start_sample = ds[360]
+    # Load single arbitrary item
+    x, y, audio_file, start_sample = ds[200]
 
     print("==== Item 10 ====")
     print("audio_file:", audio_file)
