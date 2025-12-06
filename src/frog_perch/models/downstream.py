@@ -196,35 +196,51 @@ def build_downstream(
 
         # --- Per-slice MLP projection ---
         slice_embed = layers.TimeDistributed(
-            layers.Dense(1024, activation="relu")
+            layers.Dense(512, activation="relu")
         )(x_flat)
 
-        slice_embed = layers.TimeDistributed(
-            layers.Dense(512, activation="relu")
-        )(slice_embed)  # [B, 16, 512]
+        # # Optional dropout for regularization
+        # slice_embed = layers.Dropout(0.1)(slice_embed)
 
-        # Optional dropout for regularization
-        slice_embed = layers.Dropout(0.2)(slice_embed)
+        slice_embed = layers.TimeDistributed(
+            layers.Dense(256, activation="relu")
+        )(slice_embed)  # [B, 16, 256]
+
+        # # Optional dropout for regularization
+        # slice_embed = layers.Dropout(0.1)(slice_embed)
+
+        slice_embed = layers.TimeDistributed(
+            layers.Dense(128, activation="relu")
+        )(slice_embed)  # [B, 16, 128]
+
+        # # Optional dropout for regularization
+        # slice_embed = layers.Dropout(0.1)(slice_embed)
+
+        slice_embed = layers.SpatialDropout1D(0.1)(slice_embed)  # replaces Dropout
 
         # --- Temporal neighborhood via Conv1D with residual ---
-        # Conv1D operates over time: [B, T, 512]
+        # Conv1D operates over time: [B, T, 128]
         temporal_context = layers.Conv1D(
-            filters=512,
+            filters=128,
             kernel_size=3,
             padding="same",
             activation="relu"
         )(slice_embed)
 
+        temporal_context = layers.Dropout(0.1)(temporal_context)
+
         # Residual connection: model can ignore neighbors if unhelpful
-        slice_embed = layers.Add()([slice_embed, temporal_context])  # [B, 16, 512]
+        slice_embed = layers.Add()([slice_embed, temporal_context])  # [B, 16, 128]
 
         # Optional second temporal layer (deeper receptive field)
         temporal_context2 = layers.Conv1D(
-            filters=512,
+            filters=128,
             kernel_size=3,
             padding="same",
             activation="relu"
         )(slice_embed)
+
+        temporal_context2 = layers.Dropout(0.1)(temporal_context2)
 
         slice_embed = layers.Add()([slice_embed, temporal_context2])  # [B, 16, 512]
 

@@ -23,7 +23,7 @@ METADATA_WORKERS = 8  # threads for metadata creation
 
 # Training defaults
 BATCH_SIZE = 16
-EPOCHS = 20
+EPOCHS = 50
 LEARNING_RATE = 1e-5
 LABEL_MODE = 'slice'  # 'binary' or 'count'
 STEPS_PER_EPOCH = 250
