@@ -202,9 +202,9 @@ def build_downstream(
         # # Optional dropout for regularization
         # slice_embed = layers.Dropout(0.1)(slice_embed)
 
-        slice_embed = layers.TimeDistributed(
-            layers.Dense(256, activation="relu")
-        )(slice_embed)  # [B, 16, 256]
+        # slice_embed = layers.TimeDistributed(
+        #     layers.Dense(256, activation="relu")
+        # )(slice_embed)  # [B, 16, 256]
 
         # # Optional dropout for regularization
         # slice_embed = layers.Dropout(0.1)(slice_embed)
@@ -242,7 +242,19 @@ def build_downstream(
 
         temporal_context2 = layers.Dropout(0.1)(temporal_context2)
 
-        slice_embed = layers.Add()([slice_embed, temporal_context2])  # [B, 16, 512]
+        slice_embed = layers.Add()([slice_embed, temporal_context2])  # [B, 16, 128]
+
+        # Optional third temporal layer (deeper receptive field)
+        temporal_context3 = layers.Conv1D(
+            filters=128,
+            kernel_size=3,
+            padding="same",
+            activation="relu"
+        )(slice_embed)
+
+        temporal_context3 = layers.Dropout(0.1)(temporal_context3)
+
+        slice_embed = layers.Add()([slice_embed, temporal_context3])  # [B, 16, 128]
 
         # --- Final per-slice logits ---
         slice_logits = layers.TimeDistributed(

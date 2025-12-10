@@ -122,7 +122,7 @@ def train(
 
     elif label_mode == 'slice':
         # loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-        loss = SliceLossWithSoftCountKL(max_bin=4, kl_weight=1.0)
+        loss = SliceLossWithSoftCountKL(max_bin=16, kl_weight=1.0)
         metrics = [
             tf.keras.metrics.BinaryAccuracy(name="slice_acc"),
             tf.keras.metrics.AUC(name="slice_auc"),

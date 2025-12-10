@@ -201,6 +201,13 @@ def main():
     model = load_model_for_count(ckpt)
     perch = PerchWrapper()
 
+    test = perch.get_spatial_embedding(np.random.uniform(-1, 1, 5 * 32000).astype(np.float32))
+
+    B = 8  # batch size you want to test
+    batch = np.random.uniform(-1, 1, (B, 5 * 32000)).astype(np.float32)
+    embeddings = perch.get_spatial_embedding(batch)
+    # embeddings.shape -> (B, ...)  # one embedding per input
+    
     audio_files = list_audio_files(input_dir, exts)
     if not audio_files:
         print(f"[WARN] No audio files in {input_dir}")

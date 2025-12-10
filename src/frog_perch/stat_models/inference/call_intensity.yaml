@@ -1,0 +1,8 @@
+csv_dir: /home/breallis/datasets/frog_calls/gabon_full/P2_slice_out
+stan_model: src/frog_perch/stat_models/stan/call_intensity.stan
+output_dir: stat_results/call_intensity
+
+warmup: 500
+sampling: 1000
+chains: 4
+seed: 20250101

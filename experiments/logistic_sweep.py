@@ -7,7 +7,6 @@ import os
 # os.environ["TF_CUDNN_USE_AUTOTUNE"] = "0"
 # os.environ["TF_ENABLE_XLA"] = "0"
 
-
 import json
 import csv
 import itertools
@@ -33,7 +32,18 @@ def configure_gpu():
         except Exception:
             pass
 
-def train_with_smoothing(x0, k):
+def format_param(v):
+    """
+    Consistent formatting for sweep parameters so tags are identical
+    between controller and worker. Uses general format to avoid trailing .0.
+    """
+    try:
+        # If it's numeric, format with general format to remove trailing .0
+        return "{:g}".format(float(v))
+    except Exception:
+        return str(v)
+
+def train_with_smoothing(x0, k, label_mode):
     """Run training with label smoothing enabled for sweep."""
     from frog_perch.training import train
     conf = copy.deepcopy(config.CONFIDENCE_PARAMS)
@@ -41,7 +51,7 @@ def train_with_smoothing(x0, k):
     conf["logistic_params"]["k"] = k
 
     model, val_ds = train.train(
-        label_mode=config.LABEL_MODE,
+        label_mode=label_mode,
         epochs=config.EPOCHS,
         batch_size=config.BATCH_SIZE,
         pool_method=config.POOL_METHOD,
@@ -52,7 +62,7 @@ def train_with_smoothing(x0, k):
     )
     return model, val_ds
 
-def evaluate_without_smoothing(model, batch_size, tag, sweep_dir):
+def evaluate_without_smoothing(model, batch_size, tag, sweep_dir, label_mode):
     """
     Ultimate validation: rebuild val_ds with no label smoothing and compute
     one-vs-rest precision-recall curves for each class.
@@ -72,7 +82,7 @@ def evaluate_without_smoothing(model, batch_size, tag, sweep_dir):
         train=False,
         pos_ratio=None,
         random_seed=config.RANDOM_SEED,
-        label_mode=config.LABEL_MODE,
+        label_mode=label_mode,
         val_stride_sec=1.0,
         q2_confidence=config.Q2_CONFIDENCE,
         equalize_q2_val=True,
@@ -116,15 +126,21 @@ def save_result(result_path, result):
         json.dump(result, f, indent=2)
         f.flush(); os.fsync(f.fileno())
 
-
 # ================================================================
 # Worker function
 # ================================================================
-def run_single_sweep(x0, k, sweep_dir):
-    tag = f"x0={x0}_k={k}"
+def run_single_sweep(x0, k, sweep_dir, label_mode):
+    # Use format_param to ensure identical tag formatting
+    x0s = format_param(x0)
+    ks = format_param(k)
+    tag = f"x0={x0s}_k={ks}_label={label_mode}"
     result_path = os.path.join(sweep_dir, f"{tag}.json")
 
-    if os.path.exists(result_path):
+    # Backward-compatibility: check for old-style filename without label suffix
+    old_tag = f"x0={x0s}_k={ks}"
+    old_result_path = os.path.join(sweep_dir, f"{old_tag}.json")
+
+    if os.path.exists(result_path) or os.path.exists(old_result_path):
         print(f"Skipping {tag} (already exists).", flush=True)
         os._exit(0)
 
@@ -136,17 +152,18 @@ def run_single_sweep(x0, k, sweep_dir):
     start = time.time()
 
     # Train with smoothing
-    model, val_ds = train_with_smoothing(x0, k)
+    model, val_ds = train_with_smoothing(x0, k, label_mode)
     duration = time.time() - start
     best_val_loss = float(model.history.history["val_loss"][-1])
 
     # Ultimate validation without smoothing
-    ap_scores = evaluate_without_smoothing(model, config.BATCH_SIZE, tag, sweep_dir)
+    ap_scores = evaluate_without_smoothing(model, config.BATCH_SIZE, tag, sweep_dir, label_mode)
 
     # Save JSON result
     result = {
         "x0": x0,
         "k": k,
+        "label_mode": label_mode,
         "best_val_loss": best_val_loss,
         "seconds": duration,
     }
@@ -164,7 +181,6 @@ def run_single_sweep(x0, k, sweep_dir):
     print(f"Completed {tag}: val_loss={best_val_loss:.4f}, AP scores={ap_scores}", flush=True)
 
     os._exit(0)
-
 
 # ================================================================
 # Main entry point — controller
@@ -188,12 +204,16 @@ def main():
 
     # Strict sequential execution — only one GPU user at a time
     for x0, k in sweep_items:
-        tag = f"x0={x0}_k={k}"
+        x0s = format_param(x0)
+        ks = format_param(k)
+        tag = f"x0={x0s}_k={ks}_label={config.LABEL_MODE}"
         result_path = os.path.join(sweep_dir, f"{tag}.json")
         print(f"Starting subprocess for {tag}")
 
-        # Skip if already done
-        if os.path.exists(result_path):
+        # Skip if already done (backward-compatible check)
+        old_tag = f"x0={x0s}_k={ks}"
+        old_result_path = os.path.join(sweep_dir, f"{old_tag}.json")
+        if os.path.exists(result_path) or os.path.exists(old_result_path):
             print(f"Already completed: {tag}")
             continue
 
@@ -206,6 +226,7 @@ def main():
             str(x0),
             str(k),
             sweep_dir,
+            str(config.LABEL_MODE),   # pass label_mode to worker
         ]
 
         # Stream child output live
@@ -243,7 +264,7 @@ def main():
         # Check completion artifact and return code
         if rc != 0:
             print(f"WARNING: subprocess for {tag} exited with code {rc}")
-        if not os.path.exists(result_path):
+        if not os.path.exists(result_path) and not os.path.exists(old_result_path):
             print(f"WARNING: no JSON result for {tag}. Likely stalled or crashed before save.")
 
         # Optional: small pause to let GPU driver settle between runs
@@ -253,7 +274,9 @@ def main():
     # Build summary CSV
     results = []
     for x0, k in sweep_items:
-        tag = f"x0={x0}_k={k}"
+        x0s = format_param(x0)
+        ks = format_param(k)
+        tag = f"x0={x0s}_k={ks}_label={config.LABEL_MODE}"
         result_path = os.path.join(sweep_dir, f"{tag}.json")
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -265,7 +288,7 @@ def main():
         for row in results:
             fieldnames.update(row.keys())
         # Ensure consistent ordering: put core fields first
-        core_fields = ["x0", "k", "best_val_loss", "seconds"]
+        core_fields = ["x0", "k", "label_mode", "best_val_loss", "seconds"]
         # Then any per-class AP scores (class_0_AP, class_1_AP, ...)
         extra_fields = sorted([f for f in fieldnames if f not in core_fields])
         fieldnames = core_fields + extra_fields
@@ -282,7 +305,6 @@ def main():
     else:
         print("No results found; summary CSV not created.")
 
-
 # ================================================================
 # REQUIRED: Only call main() when run as script
 # ================================================================
@@ -292,7 +314,9 @@ if __name__ == "__main__":
         x0 = float(sys.argv[2])
         k = float(sys.argv[3])
         sweep_dir = sys.argv[4]
-        run_single_sweep(x0, k, sweep_dir)
+        # optional label_mode argument (fallback to config.LABEL_MODE if not provided)
+        label_mode = sys.argv[5] if len(sys.argv) > 5 else config.LABEL_MODE
+        run_single_sweep(x0, k, sweep_dir, label_mode)
     else:
         # Controller mode
         main()

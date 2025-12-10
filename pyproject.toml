@@ -16,6 +16,8 @@ dependencies = [
     "pandas",
     "kagglehub",
     "matplotlib>=3.10.7",
+    "seaborn>=0.13.2",
+    "cmdstanpy>=1.3.0",
 ]
 
 [project.scripts]
@@ -24,6 +26,9 @@ frog-perch = "frog_perch:main"
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9"]
 build-backend = "uv_build"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.uv]
 dev-dependencies = [
