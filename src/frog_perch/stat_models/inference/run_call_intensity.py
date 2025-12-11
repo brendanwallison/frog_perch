@@ -61,6 +61,12 @@ def main():
     parser.add_argument("--chains", type=int, help="Number of MCMC chains.")
     parser.add_argument("--seed", type=int, help="Random seed.")
 
+    # ✅ NEW: allow CLI overrides for Beta hyperparameters
+    parser.add_argument("--a-call", type=float, help="Beta(a_call, b_call) parameter for call distribution.")
+    parser.add_argument("--b-call", type=float, help="Beta(a_call, b_call) parameter for call distribution.")
+    parser.add_argument("--a-bg", type=float, help="Beta(a_bg, b_bg) parameter for background distribution.")
+    parser.add_argument("--b-bg", type=float, help="Beta(a_bg, b_bg) parameter for background distribution.")
+
     args = parser.parse_args()
 
     # Hard-coded defaults
@@ -69,15 +75,22 @@ def main():
         "sampling": 1000,
         "chains": 4,
         "seed": 12345,
+
+        # default Beta hyperparameters (can be overridden)
+        "a_call": 3.0,
+        "b_call": 1.0,
+        "a_bg": 0.5,
+        "b_bg": 10.0,
     }
 
     # Load config file (if provided)
     config_path = args.config if args.config is not None else CONFIG_PATH
-    config_file = load_config_file(Path(config_path))    
+    config_file = load_config_file(Path(config_path))
 
     # Merge everything
     cli_dict = vars(args)
     cfg = merge_configs(defaults, config_file, cli_dict)
+
     # Normalize path-like entries
     for key in ["csv_dir", "stan_model", "output_dir"]:
         if isinstance(cfg.get(key), str):
@@ -104,6 +117,12 @@ def main():
         iter_sampling=cfg["sampling"],
         chains=cfg["chains"],
         seed=cfg["seed"],
+
+        # ✅ NEW: pass hyperparameters into the pipeline
+        a_call=cfg["a_call"],
+        b_call=cfg["b_call"],
+        a_bg=cfg["a_bg"],
+        b_bg=cfg["b_bg"],
     )
 
     # Save merged data

@@ -15,6 +15,7 @@ from cmdstanpy import CmdStanModel, CmdStanMCMC
 
 from .data_loading import load_detector_csvs
 from .prepare_stan_data import prepare_stan_data
+import pandas as pd
 
 
 # ------------------------------------------------------------
@@ -64,7 +65,7 @@ def print_diagnostics(fit: CmdStanMCMC) -> None:
 
 
 # ------------------------------------------------------------
-# ✅ High-level pipeline
+# ✅ High-level pipeline (UPDATED)
 # ------------------------------------------------------------
 
 def run_call_intensity_pipeline(
@@ -77,27 +78,32 @@ def run_call_intensity_pipeline(
     parallel_chains: Optional[int] = None,
     seed: int = 12345,
     show_progress: bool = True,
+
+    # ✅ NEW: Beta hyperparameters passed from config/CLI
+    a_call: float,
+    b_call: float,
+    a_bg: float,
+    b_bg: float,
 ) -> tuple[pd.DataFrame, CmdStanMCMC]:
     """
     Full end-to-end pipeline:
         1. Load detector CSVs
-        2. Prepare Stan data
+        2. Prepare Stan data (including ell_i preprocessing)
         3. Compile Stan model
         4. Run sampling
-
-    Returns
-    -------
-    df : pd.DataFrame
-        The merged detector data with timestamps and covariates.
-    fit : CmdStanMCMC
-        The fitted Stan model.
     """
 
     # Step 1: Load CSVs
     df = load_detector_csvs(csv_dir)
 
-    # Step 2: Prepare Stan data
-    stan_data = prepare_stan_data(df)
+    # Step 2: Prepare Stan data (✅ now includes ell_i)
+    stan_data = prepare_stan_data(
+        df,
+        a_call=a_call,
+        b_call=b_call,
+        a_bg=a_bg,
+        b_bg=b_bg,
+    )
 
     # Step 3: Compile model
     model = compile_call_intensity_model(stan_model_path)
