@@ -14,10 +14,9 @@ from typing import Optional, Dict, Any
 from cmdstanpy import CmdStanModel, CmdStanMCMC
 
 from .data_loading import load_detector_csvs
-# Ensure this matches your actual filename. 
-# If you created a new file for HSGP, update this import (e.g. .prepare_stan_data_hsgp).
-# If you edited the existing file, keep it as is.
-from .prepare_stan_data_binned import prepare_stan_data
+# Point this to wherever you saved the windowed data prep logic.
+# If you overwrote prepare_stan_data.py, this is correct.
+from .prepare_stan_data_windowed import prepare_stan_data
 import pandas as pd
 
 
@@ -90,25 +89,21 @@ def run_call_intensity_pipeline(
 
     use_binning: bool = False,
     
-    # NEW ARGS: Use M (frequencies) instead of K (knots)
-    K_season: int = 10,
-    K_diel: int = 10,
+    # Spline Knots (Degrees of Freedom)
+    K_season: int = 20,
+    K_diel: int = 20,
 ) -> tuple[pd.DataFrame, CmdStanMCMC]:
 
     df = load_detector_csvs(csv_dir)
 
-    # Note: If your prepare_stan_data wrapper still uses "K_season" arguments
-    # (as defined in the previous step for backward compatibility), 
-    # we map M -> K here.
+    # Pass the K arguments to the data prep function
     stan_data = prepare_stan_data(
         df,
         a_call=a_call,
         b_call=b_call,
         a_bg=a_bg,
         b_bg=b_bg,
-        
-        # Pass M_season to the data prep function
-        # (Assuming the wrapper function signature is: K_season=...)
+        use_binning=use_binning,
         K_season=K_season,
         K_diel=K_diel,
     )

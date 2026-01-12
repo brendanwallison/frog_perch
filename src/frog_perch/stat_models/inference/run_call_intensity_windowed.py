@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import yaml
 
-from frog_perch.stat_models.inference.fit_call_intensity import (
+from frog_perch.stat_models.inference.fit_call_intensity_windowed import (
     run_call_intensity_pipeline,
     print_diagnostics,
 )
@@ -105,8 +105,8 @@ def main():
         use_binning=True, 
         
         # Updated Args
-        M_season=cfg["M_season"],
-        M_diel=cfg["M_diel"],
+        K_season=cfg["K_season"],
+        K_diel=cfg["K_diel"],
     )
 
     df.to_csv(cfg["output_dir"] / "merged_detector_data.csv", index=False)
