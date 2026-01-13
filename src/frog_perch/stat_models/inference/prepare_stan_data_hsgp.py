@@ -19,24 +19,25 @@ def compute_log_odds(p, a_call, b_call, a_bg, b_bg):
     return log_f_call - log_f_bg
 
 
-def make_fourier_design_matrix(x_vals: np.ndarray, period: float, M: int) -> np.ndarray:
+def make_hsgp_basis(x_vals: np.ndarray, M: int) -> np.ndarray:
     """
-    Generates a Fourier design matrix for HSGP.
-    Result shape: (N, 2*M)
-    Columns: [cos(w1*x), sin(w1*x), cos(w2*x), sin(w2*x), ...]
+    Non-periodic HSGP basis on a bounded interval [L, R].
+    Produces shape (N, 2*M):
+      [sin(pi*x), cos(pi*x), sin(2*pi*x), cos(2*pi*x), ...]
+    after mapping x to [0,1].
     """
+    x_vals = np.asarray(x_vals)
     N = len(x_vals)
-    X = np.zeros((N, 2 * M))
+    X = np.zeros((N, 2*M))
     
-    for m in range(1, M + 1):
-        # Frequency w_m = 2*pi*m / period
-        omega = 2.0 * np.pi * m / period
-        
-        # Store Cosine at 2*(m-1)
-        X[:, 2 * (m - 1)]     = np.cos(omega * x_vals)
-        # Store Sine at 2*(m-1) + 1
-        X[:, 2 * (m - 1) + 1] = np.sin(omega * x_vals)
-        
+    L = float(np.min(x_vals))
+    R = float(np.max(x_vals))
+    x_scaled = (x_vals - L) / (R - L)
+    
+    for m in range(1, M+1):
+        X[:, 2*(m-1)]     = np.sin(np.pi * m * x_scaled)
+        X[:, 2*(m-1) + 1] = np.cos(np.pi * m * x_scaled)
+    
     return X
 
 
@@ -87,11 +88,9 @@ def prepare_stan_data_hsgp(
     obs_days = np.sort(df["day_of_year"].unique())
     obs_mins = np.sort(df["minute_of_day"].unique())
 
-    # Seasonal: Period = 365 days
-    X_season = make_fourier_design_matrix(obs_days, period=365.0, M=M_season)
+    X_season = make_hsgp_basis(obs_days, M=M_season)
+    X_diel   = make_hsgp_basis(obs_mins, M=M_diel)
 
-    # Diel: Period = 1440 minutes
-    X_diel = make_fourier_design_matrix(obs_mins, period=1440.0, M=M_diel)
 
     # 5. Create Index Maps (Value -> Matrix Row Index 1..N)
     # Stan uses 1-based indexing
@@ -152,7 +151,7 @@ def prepare_stan_data(
     b_call: float,
     a_bg: float,
     b_bg: float,
-    use_binning: bool = False,
+    use_binning: bool = True,
     # Renamed arguments for clarity, but you can map K->M if you want to keep CLI same
     M_season: int = 10, 
     M_diel: int = 10,

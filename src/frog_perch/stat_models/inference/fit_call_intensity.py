@@ -17,7 +17,7 @@ from .data_loading import load_detector_csvs
 # Ensure this matches your actual filename. 
 # If you created a new file for HSGP, update this import (e.g. .prepare_stan_data_hsgp).
 # If you edited the existing file, keep it as is.
-from .prepare_stan_data_binned import prepare_stan_data
+from .prepare_stan_data_hsgp import prepare_stan_data
 import pandas as pd
 
 
@@ -88,11 +88,11 @@ def run_call_intensity_pipeline(
     a_bg: float,
     b_bg: float,
 
-    use_binning: bool = False,
+    use_binning: bool = True,
     
     # NEW ARGS: Use M (frequencies) instead of K (knots)
-    K_season: int = 10,
-    K_diel: int = 10,
+    M_season: int = 10,
+    M_diel: int = 10,
 ) -> tuple[pd.DataFrame, CmdStanMCMC]:
 
     df = load_detector_csvs(csv_dir)
@@ -109,8 +109,8 @@ def run_call_intensity_pipeline(
         
         # Pass M_season to the data prep function
         # (Assuming the wrapper function signature is: K_season=...)
-        K_season=K_season,
-        K_diel=K_diel,
+        M_season=M_season,
+        M_diel=M_diel,
     )
 
     model = compile_call_intensity_model(stan_model_path)

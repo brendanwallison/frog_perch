@@ -1,260 +1,202 @@
 #!/usr/bin/env python3
 """
-Analysis script for call_intensity_hsgp (HSGP Fourier model).
+HSGP Call Intensity Posterior Analysis
 
-- Reconstructs FULL seasonal and diel curves using HSGP spectral densities.
-- Produces unified diagnostics for HSGP hyperparameters (alpha, rho) and error scales.
+- Loads merged detector CSVs
+- Loads posterior draws from CmdStan CSVs
+- Computes posterior predictive surfaces (seasonal + diel)
+- Includes random effects u_day and u_minute
+- Plots median + 90% CI
+- Plots posterior hyperparameters
+- Saves all plots to an output directory
 """
 
 from __future__ import annotations
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from cmdstanpy import CmdStanMCMC, from_csv
+from prepare_stan_data_hsgp import make_hsgp_basis
 
-# ---------------------------------------------------------------------
-# Paths and config
-# ---------------------------------------------------------------------
 
-RESULTS_DIR = Path("stat_results/call_intensity_hsgp_v1")
-MERGED_CSV = RESULTS_DIR / "merged_detector_data.csv"
-CSV_GLOB_PATTERN = "call_intensity_hsgp-*.csv"
+# ==============================
+# ===== User Configurable ======
+# ==============================
+CSV_PATH = Path("stat_results/call_intensity_hsgp_v2/merged_detector_data.csv")
+POSTERIOR_CSV_DIR = Path("stat_results/call_intensity_hsgp_v2")
+POSTERIOR_PATTERN = "call_intensity_hsgp-*.csv"
+OUTPUT_DIR = Path("stat_results/call_intensity_hsgp_v2/analysis_output")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-# HSGP Config (MUST MATCH STAN DATA!)
-M_SEASON = 50
-M_DIEL   = 50
+M_SEASON = 25
+M_DIEL = 100
+DAYS_MARGIN = 5
+MINUTES_MARGIN = 60
+QUANTILES = [0.05, 0.5, 0.95]  # 90% CI
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
+# ==============================
+# ===== Helper Functions =======
+# ==============================
 
-def inv_logit(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-def load_fit(results_dir: Path, pattern: str) -> CmdStanMCMC:
+def load_fit(results_dir: Path, pattern: str = POSTERIOR_PATTERN) -> CmdStanMCMC:
     csvs = sorted(results_dir.glob(pattern))
     if not csvs:
         raise RuntimeError(f"No CmdStan CSV files found in {results_dir} matching {pattern}")
     print(f"Loading {len(csvs)} chains from {results_dir}...")
     return from_csv([str(f) for f in csvs])
 
-def summarize_curve(draws_curve: np.ndarray) -> dict:
-    q = np.quantile(draws_curve, [0.025, 0.25, 0.5, 0.75, 0.975], axis=0)
+def compute_posterior_surfaces(fit: CmdStanMCMC, df_obs: pd.DataFrame):
+    """Compute posterior predictive surfaces for seasonal/diel components and full surface."""
+    df = df_obs.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["day_of_year"] = df["date"].dt.dayofyear
+    minutes_obs = (df["time_of_day_hours"]*60).astype(int)
+
+    # Windowed grids
+    day_grid = np.arange(df["day_of_year"].min()-DAYS_MARGIN,
+                         df["day_of_year"].max()+DAYS_MARGIN+1)
+    min_grid = np.arange(minutes_obs.min()-MINUTES_MARGIN,
+                         minutes_obs.max()+MINUTES_MARGIN+1)
+
+    X_s = make_hsgp_basis(day_grid, M=M_SEASON)
+    X_m = make_hsgp_basis(min_grid, M=M_DIEL)
+
+    # Extract draws
+    draws = fit.draws_pd()
+    n_draws = len(draws)
+
+    # --- Seasonal ---
+    beta_s_cols = [f"beta_season[{i+1}]" for i in range(2*M_SEASON)]
+    mu_s = draws["mu_season"].to_numpy()[:, None]
+    beta_s = draws[beta_s_cols].to_numpy()
+    s_smooth = mu_s + beta_s @ X_s.T
+
+    # Daily random effect
+    u_day_std_cols = [f"u_day_std[{i+1}]" for i in range(df["day_of_year"].nunique())]
+    u_day_std = draws[u_day_std_cols].to_numpy()
+    sigma_day = draws["sigma_day_proc"].to_numpy()[:, None]
+    u_day = sigma_day * u_day_std
+
+    # Map u_day to grid days
+    day_map = {val: i for i, val in enumerate(sorted(df["day_of_year"].unique()))}
+    u_day_grid = np.zeros((n_draws, len(day_grid)))
+    for i, d in enumerate(day_grid):
+        if d in day_map:
+            u_day_grid[:, i] = u_day[:, day_map[d]]
+
+    s_with_day = s_smooth + u_day_grid
+    p_smooth = 1/(1+np.exp(-s_smooth))
+    p_with_day = 1/(1+np.exp(-s_with_day))
+
+    # --- Diel ---
+    beta_m_cols = [f"beta_diel[{i+1}]" for i in range(2*M_DIEL)]
+    mu_m = draws["mu_diel"].to_numpy()[:, None]
+    beta_m = draws[beta_m_cols].to_numpy()
+    g_smooth = mu_m + beta_m @ X_m.T
+
+    u_min_std_cols = [f"u_minute_std[{i+1}]" for i in range(len(min_grid))]
+    # For minute effects, if exact indices not available, just skip u_min
+    if all(col in draws.columns for col in u_min_std_cols):
+        u_min_std = draws[u_min_std_cols].to_numpy()
+        sigma_min = draws["sigma_minute"].to_numpy()[:, None]
+        u_min_grid = u_min_std * sigma_min
+        g_with_min = g_smooth + u_min_grid
+    else:
+        g_with_min = g_smooth
+
+    p_diel_smooth = 1/(1+np.exp(-g_smooth))
+    p_diel_with_min = 1/(1+np.exp(-g_with_min))
+
+    # --- Full 2D surface ---
+    surface = np.einsum('id,im->idm', p_smooth, p_diel_smooth)
+    surface_mean = surface.mean(axis=0)
+
     return {
-        "mean":   draws_curve.mean(axis=0),
-        "q025":   q[0],
-        "q25":    q[1],
-        "median": q[2],
-        "q75":    q[3],
-        "q975":   q[4],
+        "day_grid": day_grid,
+        "min_grid": min_grid,
+        "p_smooth": p_smooth,
+        "p_with_day": p_with_day,
+        "p_diel_smooth": p_diel_smooth,
+        "p_diel_with_min": p_diel_with_min,
+        "surface_mean": surface_mean,
+        "draws": draws
     }
 
-def plot_with_bands(x: np.ndarray, summary: dict, title: str, xlabel: str, ylabel: str, out_path: Path, observed_x: np.ndarray = None):
-    plt.figure(figsize=(10, 5))
-    
-    # Plot bands
-    plt.fill_between(x, summary["q025"], summary["q975"], color="lightgray", alpha=0.5, label="95% CI")
-    plt.fill_between(x, summary["q25"], summary["q75"], color="gray", alpha=0.5, label="50% CI")
-    plt.plot(x, summary["median"], color="black", lw=1.5, label="Median")
-
-    # Add Rug Plot for data presence if provided
-    if observed_x is not None:
-        # Normalize observed_x if plotting hours (0-24) but data is minutes (0-1440)
-        # We assume the caller handles unit matching, but we'll check range
-        rug_x = observed_x
-        if xlabel == "Hour of Day" and observed_x.max() > 24:
-             rug_x = observed_x / 60.0
-             
-        plt.scatter(rug_x, np.full_like(rug_x, summary["q025"].min()), 
-                    marker='|', color='red', alpha=0.3, s=10, label="Data Present")
-
-    plt.title(title)
+def plot_quantiles(x, draws, quantiles, xlabel, ylabel, title, fname):
+    q_vals = {f"q{int(q*100)}": np.quantile(draws, q, axis=0) for q in quantiles}
+    plt.figure(figsize=(10,5))
+    plt.fill_between(x, q_vals["q5"], q_vals["q95"], alpha=0.5, color="lightgray", label="90% CI")
+    plt.plot(x, q_vals["q50"], color="black", lw=1.5, label="Median")
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.legend(loc="best")
+    plt.title(title)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+    plt.savefig(OUTPUT_DIR/fname, dpi=200)
     plt.close()
 
-# ---------------------------------------------------------------------
-# HSGP Reconstruction Logic
-# ---------------------------------------------------------------------
+def plot_surface(day_grid, min_grid, surface, fname):
+    plt.figure(figsize=(12,6))
+    plt.imshow(surface.T, origin='lower',
+               extent=[day_grid[0], day_grid[-1], min_grid[0], min_grid[-1]],
+               aspect='auto', cmap='viridis')
+    plt.colorbar(label="P(Call)")
+    plt.xlabel("Day of Year")
+    plt.ylabel("Minute of Day")
+    plt.title("Posterior Predictive Call Probability Surface (Median)")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR/fname, dpi=200)
+    plt.close()
 
-def make_fourier_design_matrix(x_vals: np.ndarray, period: float, M: int) -> np.ndarray:
-    """
-    Generates a Fourier design matrix.
-    """
-    N = len(x_vals)
-    X = np.zeros((N, 2 * M))
-    for m in range(1, M + 1):
-        omega = 2.0 * np.pi * m / period
-        X[:, 2 * (m - 1)]     = np.cos(omega * x_vals)
-        X[:, 2 * (m - 1) + 1] = np.sin(omega * x_vals)
-    return X
-
-
-def compute_diagSPD(alpha: np.ndarray, rho: np.ndarray, period: float, M: int) -> np.ndarray:
-    """
-    Computes the Spectral Density vector for Squared Exponential (RBF).
-    S(w) = alpha^2 * sqrt(2*pi) * rho * exp(-0.5 * rho^2 * w^2)
-    """
-    n_draws = len(alpha)
-    diagSPD = np.zeros((n_draws, 2 * M))
-    
-    # Precompute constant term: alpha^2 * sqrt(2pi) * rho
-    # alpha, rho are shape (n_draws,)
-    term1 = (alpha**2) * np.sqrt(2.0 * np.pi) * rho
-
-    for m in range(1, M + 1):
-        w = 2.0 * np.pi * m / period
-        
-        # S(w) formula for RBF
-        S = term1 * np.exp(-0.5 * (rho * w)**2)
-        
-        sqrt_S = np.sqrt(S)
-        
-        # Fill both Cos and Sin slots
-        diagSPD[:, 2*(m-1)]     = sqrt_S
-        diagSPD[:, 2*(m-1) + 1] = sqrt_S
-        
-    return diagSPD
-
-
-def reconstruct_curves(fit: CmdStanMCMC, X_season_full, X_diel_full, M_season, M_diel):
-    """
-    Computes curve = mu + X * (beta * diagSPD) for every draw.
-    """
-    # 1. Extract Parameters
-    mu_season    = fit.stan_variable("mu_season")     # (draws,)
-    beta_season  = fit.stan_variable("beta_season")   # (draws, 2*M)
-    alpha_season = fit.stan_variable("alpha_season")  # (draws,)
-    rho_season   = fit.stan_variable("rho_season")    # (draws,)
-    
-    mu_diel      = fit.stan_variable("mu_diel")
-    beta_diel    = fit.stan_variable("beta_diel")
-    alpha_diel   = fit.stan_variable("alpha_diel")
-    rho_diel     = fit.stan_variable("rho_diel")
-
-    # 2. Compute Spectral Densities (Scaling Factors)
-    # shape: (draws, 2*M)
-    spd_season = compute_diagSPD(alpha_season, rho_season, 365.0, M_season)
-    spd_diel   = compute_diagSPD(alpha_diel,   rho_diel,   1440.0, M_diel)
-
-    # 3. Apply Scaling (Non-Centered Parameterization)
-    # beta_scaled = beta_raw * sqrt(S)
-    beta_season_scaled = beta_season * spd_season
-    beta_diel_scaled   = beta_diel   * spd_diel
-
-    # 4. Project to Time Domain
-    # s = mu + X @ beta_scaled.T
-    # (draws, 1) + (draws, 2M) @ (2M, T) -> (draws, T)
-    
-    # Einsum: 'dk, tk -> dt' 
-    # d=draws, k=basis_funcs, t=time_points
-    s_logit = mu_season[:, None] + np.einsum('dk,tk->dt', beta_season_scaled, X_season_full)
-    p_season = inv_logit(s_logit)
-
-    g_logit = mu_diel[:, None]   + np.einsum('dk,tk->dt', beta_diel_scaled,   X_diel_full)
-    p_diel = inv_logit(g_logit)
-
-    return p_season, p_diel
-
-# ---------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------
-
-def plot_diagnostics(fit: CmdStanMCMC, outdir: Path):
-    outdir.mkdir(parents=True, exist_ok=True)
-    summ = fit.summary()
-    
-    # Histograms of Rhat/ESS
-    for metric in ["R_hat", "ESS_bulk", "ESS_tail"]:
-        plt.figure(figsize=(6, 4))
-        plt.hist(summ[metric], bins=30)
-        plt.title(f"Histogram of {metric}")
-        plt.savefig(outdir / f"hist_{metric}.png")
+def plot_hyperparameters(draws):
+    scalar_hyperparams = [
+        "mu_season", "mu_diel",
+        "alpha_season", "alpha_diel",
+        "rho_season", "rho_diel",
+        "sigma_day_proc", "sigma_minute"
+    ]
+    for param in scalar_hyperparams:
+        if param not in draws.columns:
+            continue
+        plt.figure(figsize=(6,4))
+        plt.hist(draws[param], bins=50, density=True, alpha=0.7, color="steelblue")
+        plt.title(f"Posterior of {param}")
+        plt.xlabel(param)
+        plt.ylabel("Density")
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR/f"{param}_posterior.png", dpi=200)
         plt.close()
 
-    # Posterior of Error Scales & Hyperparameters
-    params_to_plot = [
-        "sigma_day_proc", "sigma_ell", 
-        "alpha_season", "rho_season", 
-        "alpha_diel", "rho_diel"
-    ]
-    
-    for param in params_to_plot:
-        try:
-            data = fit.stan_variable(param)
-            plt.figure(figsize=(6,4))
-            plt.hist(data, bins=50, density=True, alpha=0.7)
-            plt.title(f"Posterior: {param}")
-            plt.grid(alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(outdir / f"post_{param}.png")
-            plt.close()
-        except Exception:
-            print(f"Skipping {param} (not found)")
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+# ==============================
+# ===== Main Pipeline ==========
+# ==============================
 
 def main():
-    if not RESULTS_DIR.exists():
-        print(f"Error: Results directory {RESULTS_DIR} not found.")
-        return
+    print("Loading merged detector CSV...")
+    df = pd.read_csv(CSV_PATH)
 
-    # 1. Load Model
-    fit = load_fit(RESULTS_DIR, CSV_GLOB_PATTERN)
-    
-    # 2. Load Observed Data (for Rug Plot)
-    obs_days = None
-    obs_mins = None
-    if MERGED_CSV.exists():
-        df = pd.read_csv(MERGED_CSV)
-        if "day_of_year" in df.columns:
-            obs_days = df["day_of_year"].unique()
-        if "minute_of_day" in df.columns:
-            obs_mins = df["minute_of_day"].unique()
-            
-    # 3. Generate Full Design Matrices
-    print("Generating full Fourier design matrices...")
-    full_days = np.arange(1, 366)
-    full_mins = np.arange(0, 1440)
-    
-    X_s = make_fourier_design_matrix(full_days, 365.0, M_SEASON)
-    X_d = make_fourier_design_matrix(full_mins, 1440.0, M_DIEL)
-    
-    # 4. Reconstruct Curves
-    print("Reconstructing HSGP curves from posterior...")
-    p_season_draws, p_diel_draws = reconstruct_curves(fit, X_s, X_d, M_SEASON, M_DIEL)
-    
-    summ_season = summarize_curve(p_season_draws)
-    summ_diel   = summarize_curve(p_diel_draws)
+    print("Loading posterior draws...")
+    fit = load_fit(POSTERIOR_CSV_DIR, POSTERIOR_PATTERN)
 
-    # 5. Plotting
-    print("Plotting...")
-    plot_diagnostics(fit, RESULTS_DIR)
+    print("Computing posterior surfaces...")
+    post = compute_posterior_surfaces(fit, df)
 
-    plot_with_bands(
-        full_days, summ_season, 
-        "Seasonal Probability (HSGP)", 
-        "Day of Year", "P(Call)", 
-        RESULTS_DIR / "seasonal_curve.png",
-        observed_x=obs_days
-    )
+    print("Plotting seasonal curves...")
+    plot_quantiles(post["day_grid"], post["p_smooth"], QUANTILES, "Day of Year", "P(Call)", "Seasonal Probability (Smooth)", "seasonal_smooth.png")
+    plot_quantiles(post["day_grid"], post["p_with_day"], QUANTILES, "Day of Year", "P(Call)", "Seasonal Probability + Daily Random Effects", "seasonal_with_day.png")
 
-    plot_with_bands(
-        full_mins / 60.0, summ_diel, 
-        "Diel Probability (HSGP)", 
-        "Hour of Day", "P(Call)", 
-        RESULTS_DIR / "diel_curve.png",
-        observed_x=obs_mins
-    )
+    print("Plotting diel curves...")
+    plot_quantiles(post["min_grid"]/60, post["p_diel_smooth"], QUANTILES, "Hour of Day", "P(Call)", "Diel Probability (Smooth)", "diel_smooth.png")
+    plot_quantiles(post["min_grid"]/60, post["p_diel_with_min"], QUANTILES, "Hour of Day", "P(Call)", "Diel Probability + Minute Random Effects", "diel_with_min.png")
 
-    print(f"Done! Results in {RESULTS_DIR}")
+    print("Plotting 2D posterior surface...")
+    plot_surface(post["day_grid"], post["min_grid"], post["surface_mean"], "call_surface_heatmap.png")
+
+    print("Plotting scalar hyperparameters...")
+    plot_hyperparameters(post["draws"])
+
+    print(f"All plots saved to {OUTPUT_DIR.resolve()}")
 
 if __name__ == "__main__":
     main()

@@ -65,8 +65,8 @@ def main():
 
         "a_call": 3.0,
         "b_call": 1.0,
-        "a_bg": 0.5,
-        "b_bg": 10.0,
+        "a_bg": 1.0,
+        "b_bg": 5.0,
     }
 
     config_path = args.config if args.config is not None else CONFIG_PATH
