@@ -1,0 +1,25 @@
+csv_dir: /home/breallis/datasets/frog_calls/gabon_full/P2_slice_out
+# Note: Ensure this points to your new Likelihood Profile Stan file
+stan_model: src/frog_perch/stat_models/stan/call_intensity_profile.stan
+output_dir: stat_results/call_intensity_profile_v1
+
+# MCMC Settings
+warmup: 150
+sampling: 150
+chains: 4
+seed: 20250101
+
+# Aggregation Settings (Likelihood Profile)
+bin_duration_sec: 0.3125   # Sub-second bin size
+window_length_sec: 5.0  # Analysis window length
+
+# HSGP Complexity (Number of Frequencies)
+M_season: 25
+M_diel: 100
+
+# Calibration (Beta Distribution Params)
+# Defaults based on previous discussions
+a_call: 3.0
+b_call: 1.0
+a_bg: 1.0
+b_bg: 5.0

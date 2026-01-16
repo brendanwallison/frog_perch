@@ -1,6 +1,6 @@
 csv_dir: /home/breallis/datasets/frog_calls/gabon_full/P2_slice_out
-stan_model: src/frog_perch/stat_models/stan/call_intensity_spline_windowed.stan
-output_dir: stat_results/call_intensity_spline_windowed_v1
+stan_model: src/frog_perch/stat_models/stan/call_intensity_hsgp.stan
+output_dir: stat_results/call_intensity_hsgp_v2
 
 warmup: 150
 sampling: 150
@@ -9,5 +9,5 @@ seed: 20250101
 use_binning: True
 
 # Spline Complexity
-K_season: 10
-K_diel: 10
+M_season: 50
+M_diel: 200
