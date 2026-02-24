@@ -30,7 +30,7 @@ STEPS_PER_EPOCH = 250
 
 # Validation defaults
 VAL_STRIDE_SEC = 1
-EQUALIZE_Q2_VAL = True
+EQUALIZE_Q2_VAL = False
 
 # Checkpoints
 CHECKPOINT_DIR = 'checkpoints'
@@ -57,7 +57,6 @@ CONFIDENCE_PARAMS = {
         "std": 246.82156166917892,
     },
     "logistic_params": {
-        # These are example defaults — adjust based on tuning
         'k': 1.0,
         'x0': -4.0,
         'lower': 0.0, 

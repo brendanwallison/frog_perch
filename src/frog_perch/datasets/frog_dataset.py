@@ -450,6 +450,7 @@ class FrogPerchDataset:
             )
             label = soft_count_distribution(weights)
 
+        ### Fix
         elif self.label_mode == 'slice':
             label = slice_binary_confidences(
                 annotations,

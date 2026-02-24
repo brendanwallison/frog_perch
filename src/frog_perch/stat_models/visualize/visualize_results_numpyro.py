@@ -220,32 +220,36 @@ def plot_total_intensity(idata, windows_df, output_dir: Path):
 
 def plot_absolute_decomposition(idata, windows_df, output_dir: Path):
     """
-    NEW: Visualizes the model in the Absolute Scale (Calls per Window).
+    NEW: Visualizes the model in the Absolute Scale (Calls per Minute).
     Decomposes into 'Nightly Peak Magnitude' and 'Relative Diel Shape'.
     """
-    print("Generating Absolute Scale Decomposition...")
+    print("Generating Absolute Scale Decomposition (CPM)...")
     
-    # 1. Extract Posterior Samples and Stack Chains
+    # --- 0. Calculate Rate Scalar (Window -> Minute) ---
+    # We grab the first window to determine the duration
+    t_start = pd.to_datetime(windows_df["start_time"].iloc[0])
+    t_end   = pd.to_datetime(windows_df["end_time"].iloc[0])
+    
+    window_sec = (t_end - t_start).total_seconds()
+    cpm_scale = 60.0 / window_sec
+    
+    print(f"  > Detected Window Duration: {window_sec:.2f}s")
+    print(f"  > Scaling Factor (to Calls/Min): {cpm_scale:.2f}x")
+
+    # 1. Extract Posterior Samples
     post = idata.posterior.stack(sample=("chain", "draw"))
     
     # --- Part A: The Diel Shape (0-1) ---
     tod = windows_df["mid_time_hour"].values
     
-    # FIX: Explicitly transpose to (sample, time) so .values is predictable
-    # ArviZ/XArray sometimes defaults to (time, sample)
+    # Transpose to (sample, time)
     diel_trend_full = post["trend_diel"].transpose("sample", ...).values 
     
-    # Sort by time of day
     sort_idx = np.argsort(tod)
     tod_sorted = tod[sort_idx]
-    
-    # Apply sorting to the Time axis (Axis 1)
     diel_sorted = diel_trend_full[:, sort_idx]
     
-    # Exponentiate & Normalize to 0-1
     diel_exp = np.exp(diel_sorted)
-    
-    # Normalize per sample (row-wise max)
     diel_max = diel_exp.max(axis=1, keepdims=True)
     diel_norm = diel_exp / diel_max
     
@@ -254,38 +258,38 @@ def plot_absolute_decomposition(idata, windows_df, output_dir: Path):
     d_hi = np.quantile(diel_norm, 0.975, axis=0)
 
     # --- Part B: The Nightly Peak Magnitude ---
-    # Ensure all these are (sample, ...) or (sample, time)
-    beta0 = post["beta_0"].values                                     # (sample,)
-    season = post["trend_season"].transpose("sample", ...).values     # (sample, time)
-    alpha = post["alpha_day"].transpose("sample", ...).values         # (sample, days)
+    beta0 = post["beta_0"].values                                     
+    season = post["trend_season"].transpose("sample", ...).values     
+    alpha = post["alpha_day"].transpose("sample", ...).values         
     
-    # Organize by Unique Days
     unique_dates = sorted(pd.to_datetime(windows_df["start_time"]).dt.date.unique())
     num_days = len(unique_dates)
     season_daily = np.zeros((season.shape[0], num_days))
     
-    # Map season trend to days
     doy = windows_df["day_of_year"].values
     unique_doy = sorted(list(set(doy)))
     
     for i, d in enumerate(unique_doy):
-        # Find first index of this day to grab the seasonal value
-        # (Assuming season is constant or smooth across the day)
         idx = np.where(doy == d)[0][0]
         season_daily[:, i] = season[:, idx]
 
-    # Calculate Peak Rate
-    # Note: We add log(diel_max) to account for the scaling we took out of Part A
+    # Calculate Peak Rate (Per Window)
     log_diel_max = np.log(diel_max) 
-    
-    # Broadcast shapes: (S,1) + (S,D) + (S,D) + (S,1) -> (S,D)
     log_peak_rate = (beta0[:, None] + season_daily + alpha + log_diel_max)
-    peak_rate = np.exp(log_peak_rate)
+    peak_rate_window = np.exp(log_peak_rate)
     
-    p_mean = peak_rate.mean(axis=0)
-    p_lo = np.quantile(peak_rate, 0.025, axis=0)
-    p_hi = np.quantile(peak_rate, 0.975, axis=0)
+    # SCALE TO PER MINUTE
+    peak_rate_cpm = peak_rate_window * cpm_scale
     
+    p_mean = peak_rate_cpm.mean(axis=0)
+    p_lo = np.quantile(peak_rate_cpm, 0.025, axis=0)
+    p_hi = np.quantile(peak_rate_cpm, 0.975, axis=0)
+    
+    # Calculate Potential (Per Minute)
+    potential_window = np.exp(beta0[:, None] + season_daily + log_diel_max)
+    potential_cpm = potential_window * cpm_scale
+    pot_mean = potential_cpm.mean(axis=0)
+
     # --- Plotting ---
     fig, axes = plt.subplots(2, 1, figsize=(12, 10), constrained_layout=True)
     
@@ -294,13 +298,10 @@ def plot_absolute_decomposition(idata, windows_df, output_dir: Path):
     ax0.plot(unique_dates, p_mean, 'o-', color='tab:purple', label="Est. Peak Rate")
     ax0.fill_between(unique_dates, p_lo, p_hi, color='tab:purple', alpha=0.3)
     
-    # Add "Potential" (Without Weather)
-    potential = np.exp(beta0[:, None] + season_daily + log_diel_max)
-    pot_mean = potential.mean(axis=0)
     ax0.plot(unique_dates, pot_mean, '--', color='black', alpha=0.7, label="Seasonal Trend (Avg Weather)")
     
-    ax0.set_title("Nightly Peak Call Intensity (Weather + Climate)")
-    ax0.set_ylabel("Max Calls per Window")
+    ax0.set_title(f"Nightly Peak Call Intensity (Scaled to Minute)")
+    ax0.set_ylabel("Max Calls per Minute")
     ax0.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
     ax0.legend()
     
@@ -313,9 +314,9 @@ def plot_absolute_decomposition(idata, windows_df, output_dir: Path):
     ax1.set_ylabel("Relative Intensity (0 - 1)")
     ax1.set_xlabel("Hour of Day")
     ax1.set_ylim(0, 1.05)
-    ax1.set_xlim(17, 23)
+    ax1.set_xlim(17, 21)
     
-    plt.savefig(output_dir / "absolute_decomposition.png", dpi=150)
+    plt.savefig(output_dir / "absolute_decomposition_cpm.png", dpi=150)
     plt.close()
 
 def main():

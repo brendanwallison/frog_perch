@@ -115,15 +115,14 @@ def targets_to_soft_counts(slice_targets, max_bin=4, expected_T=16):
 class SliceToCountWrapper(tf.keras.metrics.Metric):
     """
     Wraps a clip-level metric so it can be applied to slice-level logits.
-    Converts both predictions and targets to soft count distributions.
     """
-
     def __init__(self, base_metric, max_bin=4, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.base_metric = base_metric
         self.max_bin = max_bin
 
     def update_state(self, y_true, y_pred, sample_weight=None):
+        # (Assuming functions targets_to_soft_counts/slices_to_soft_counts are defined in this file)
         true_counts = targets_to_soft_counts(y_true, max_bin=self.max_bin)
         pred_counts = slices_to_soft_counts(y_pred, max_bin=self.max_bin)
         self.base_metric.update_state(true_counts, pred_counts, sample_weight)
@@ -133,6 +132,49 @@ class SliceToCountWrapper(tf.keras.metrics.Metric):
 
     def reset_state(self):
         self.base_metric.reset_state()
+
+    def get_config(self):
+        """Standard Keras serialization: save the arguments needed to recreate this class."""
+        config = super().get_config()
+        config.update({
+            "base_metric": tf.keras.metrics.serialize(self.base_metric),
+            "max_bin": self.max_bin,
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        """
+        Custom deserialization to handle legacy checkpoints where 'base_metric' is missing.
+        """
+        # Case 1: The model was saved correctly (has base_metric)
+        if "base_metric" in config:
+            config["base_metric"] = tf.keras.metrics.deserialize(config["base_metric"])
+            return cls(**config)
+
+        # Case 2: RESCUE MODE - The model is broken (missing base_metric)
+        # We infer the correct base metric using the saved 'name' string.
+        name = config.get("name", "")
+        base_metric = None
+
+        if "expected_count_mae" in name:
+            base_metric = ExpectedCountMAE()
+        elif "emd" in name:
+            base_metric = EMD()
+        elif "recall" in name:
+            base_metric = ExpectedRecall()
+        elif "precision" in name:
+            base_metric = ExpectedPrecision()
+        elif "binary_accuracy" in name:
+            base_metric = ExpectedBinaryAccuracy()
+        
+        if base_metric is None:
+            # Fallback for unexpected names
+            print(f"Warning: Could not infer base_metric for {name}. Defaulting to ExpectedCountMAE.")
+            base_metric = ExpectedCountMAE()
+
+        # Inject the recovered metric and return the class
+        return cls(base_metric=base_metric, **config)
 
 
 # ------------------------------------------------------------
@@ -235,7 +277,7 @@ def soft_count_kl_loss(y_true_slices, y_pred_logits, max_bin=4):
     return tf.reduce_mean(kl)
 
 class SliceLossWithSoftCountKL(tf.keras.losses.Loss):
-    def __init__(self, max_bin=4, kl_weight=1.0, name="slice_bce_plus_kl"):
+    def __init__(self, max_bin=4, kl_weight=1.0, name="slice_bce_plus_kl", **kwargs):
         super().__init__(name=name)
         self.max_bin = max_bin
         self.kl_weight = kl_weight

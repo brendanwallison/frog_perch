@@ -6,8 +6,8 @@ data {
   int<lower=1> M_season;
   int<lower=1> M_diel;
 
-  matrix[D_obs, 2*M_season] X_season; // non-periodic HSGP features
-  matrix[M_obs, 2*M_diel]   X_diel;   // non-periodic HSGP features
+  matrix[D_obs, 2*M_season] X_season;
+  matrix[M_obs, 2*M_diel]   X_diel;
 
   array[B] int<lower=1, upper=D_obs> day_idx;
   array[B] int<lower=1, upper=M_obs> diel_idx;
@@ -29,13 +29,7 @@ parameters {
   real<lower=0> rho_diel;
   vector[2*M_diel] beta_diel;
 
-  // Random effects
-  real<lower=0> sigma_day_proc;
-  real<lower=0> sigma_minute;
-  vector[D_obs] u_day_std;
-  vector[M_obs] u_minute_std;
-
-  // Global detection noise
+  // Observation noise
   real<lower=0> sigma_det;
 }
 
@@ -43,11 +37,10 @@ transformed parameters {
   vector[2*M_season] diagSPD_season;
   vector[2*M_diel]   diagSPD_diel;
 
-  // RBF spectral density factors (no period)
   {
     real term1 = square(alpha_season) * sqrt(2*pi()) * rho_season;
     for (m in 1:M_season) {
-      real w = m; // frequency index (units determined by upstream scaling)
+      real w = m;
       real S = term1 * exp(-0.5 * square(rho_season * w));
       diagSPD_season[2*m-1] = sqrt(S);
       diagSPD_season[2*m]   = sqrt(S);
@@ -67,13 +60,9 @@ transformed parameters {
   vector[D_obs] s_smooth = mu_season + X_season * (beta_season .* diagSPD_season);
   vector[M_obs] g_smooth = mu_diel   + X_diel   * (beta_diel   .* diagSPD_diel);
 
-  vector[D_obs] u_day    = sigma_day_proc * u_day_std;
-  vector[M_obs] u_minute = sigma_minute   * u_minute_std;
+  vector[D_obs] p_season = inv_logit(s_smooth);
+  vector[M_obs] p_diel   = inv_logit(g_smooth);
 
-  vector[D_obs] p_season = inv_logit(s_smooth + u_day);
-  vector[M_obs] p_diel   = inv_logit(g_smooth + u_minute);
-
-  // Bin-level logit mixture
   vector[B] q_bin_logit;
   for (b in 1:B)
     q_bin_logit[b] = logit(p_season[day_idx[b]] * p_diel[diel_idx[b]]);
@@ -87,19 +76,13 @@ model {
   alpha_season ~ normal(0, 1);
   alpha_diel   ~ normal(0, 1);
 
-  rho_season ~ normal(0.3, 0.1); // smaller values = smoother, adjust as needed
+  rho_season ~ normal(0.3, 0.1);
   rho_diel   ~ normal(0.05, 0.1);
 
   beta_season ~ std_normal();
-  beta_diel   ~ std_normal();
+  beta_diel ~ std_normal();
 
-  sigma_day_proc ~ normal(0, 0.05);
-  sigma_minute   ~ normal(0, 0.05);
-
-  u_day_std ~ std_normal();
-  u_minute_std ~ std_normal();
-
-  sigma_det ~ normal(0, 0.05);
+  sigma_det ~ exponential(1);
 
   // Likelihood
   ell_bin ~ normal(q_bin_logit, sigma_det);

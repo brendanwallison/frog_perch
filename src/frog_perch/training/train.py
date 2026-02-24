@@ -185,7 +185,7 @@ def train(
         epochs=epochs,
         callbacks=callbacks,
         steps_per_epoch=steps_per_epoch,
-        verbose=2  # <-- ADD THIS LINE
+        verbose=2
     )
 
     return model, val_ds

@@ -249,7 +249,7 @@ def prepare_stan_data_splines(
     spline_params = {
         "season_step": knot_spacing_season_days,
         "diel_step_min": knot_spacing_diel_min,
-        "diel_bounds": (17.0, 23.0)
+        "diel_bounds": (17.0, 21.0)
     }
 
     windows_df = pd.DataFrame(window_metadata)
