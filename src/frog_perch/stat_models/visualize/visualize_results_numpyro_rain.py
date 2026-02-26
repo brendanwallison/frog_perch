@@ -89,8 +89,14 @@ def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
         decomp["rain_fast"][i] = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
         
         ks = get_param(draw, "k_slow")
-        ws_sat = ws / (ks + ws)
-        decomp["rain_slow"][i] = get_param(draw, "gamma_slow") * (ws_sat - np.mean(ws_sat))
+        ns = get_param(draw, "n_slow_val")
+
+        ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
+
+        decomp["rain_slow"][i] = (
+            get_param(draw, "gamma_slow") *
+            (ws_hill - np.mean(ws_hill))
+        )
         
         decomp["alpha_day"][i] = get_param(draw, "alpha_day_raw") * get_param(draw, "sigma_day")
         decomp["beta_0"][i] = get_param(draw, "beta_0")
@@ -190,7 +196,10 @@ def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
     for d in iterate_draws(idata):
         wf = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_fast"))
         ws = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_slow"))
-        sat = ws / (get_param(d, "k_slow") + ws)
+        ks = get_param(d, "k_slow")
+        ns = get_param(d, "n_slow")
+
+        sat = (ws ** ns) / (ks ** ns + ws ** ns)
         wf_l.append(wf); ws_l.append(ws); sat_l.append(sat)
     
     days = np.arange(len(precip_daily))
@@ -209,7 +218,7 @@ def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
     axt1 = ax[1].twinx()
     arr_s, arr_sat = np.array(ws_l), np.array(sat_l)
     axt1.plot(days, arr_s.mean(0), color='tab:cyan', ls='--', alpha=0.6, label="Raw Slow ($W_s$)")
-    axt1.plot(days, arr_sat.mean(0), color='tab:red', lw=2, label="Saturated Effect ($Sat_s$)")
+    axt1.plot(days, arr_sat.mean(0), color='tab:red', lw=2, label="Hill Effect ($Hill(W_s)$)")
     axt1.fill_between(days, np.percentile(arr_sat, 2.5, 0), np.percentile(arr_sat, 97.5, 0), color='tab:red', alpha=0.2)
     ax[1].set_title("Slow Hydrological Scale (Saturation)")
     
@@ -239,8 +248,11 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
         wf = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_fast"))
         ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
         r_f = get_param(draw, "gamma_fast") * (wf/(np.std(wf)+1e-6) - np.mean(wf/(np.std(wf)+1e-6)))
-        r_s = get_param(draw, "gamma_slow") * (ws/(get_param(draw, "k_slow")+ws) - np.mean(ws/(get_param(draw, "k_slow")+ws)))
-        all_t.append(r_f + r_s)
+        r_s = get_param(draw, "gamma_slow") * (
+            ws/(get_param(draw, "k_slow")+ws) 
+            - np.mean(ws/(get_param(draw, "k_slow")+ws))
+        )
+    all_t.append(r_f + r_s)
     mu, lo, hi = np.mean(all_t, 0), np.percentile(all_t, 2.5, 0), np.percentile(all_t, 97.5, 0)
     plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu)
     plt.fill_between(viz_meta["full_calendar"], lo, hi, alpha=0.2)
@@ -249,7 +261,12 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_v8"),
+        help="Directory containing inference outputs (default: current directory)"
+    )
     args = parser.parse_args()
 
     idata = az.from_netcdf(args.output_dir / "inference_data_rain.nc")

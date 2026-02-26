@@ -12,7 +12,7 @@ import pandas as pd
 # 1. Load Utilities
 from frog_perch.stat_models.inference.data_loading import load_detector_csvs
 from frog_perch.stat_models.data.data_prep_for_rainfall_model import prepare_stan_data_hydrological
-from frog_perch.stat_models.numpyro.call_intensity_profile_rain import compile_and_run
+from frog_perch.stat_models.numpyro.call_intensity_profile_rain_hill import compile_and_run
 
 def load_config(path):
     with open(path, "r") as f:
