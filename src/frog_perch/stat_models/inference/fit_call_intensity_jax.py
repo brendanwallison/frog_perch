@@ -9,7 +9,7 @@ import arviz as az
 import pandas as pd
 
 # 1. Load Data Loading Utility
-from frog_perch.stat_models.inference.data_loading import load_detector_csvs
+from frog_perch.stat_models.data.data_loading import load_detector_csvs
 
 # 2. Load Data Prep Utility 
 from frog_perch.stat_models.inference.prepare_stan_data_likelihood_profile_splines import prepare_stan_data_splines

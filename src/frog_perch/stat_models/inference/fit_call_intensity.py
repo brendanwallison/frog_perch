@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any
 
 from cmdstanpy import CmdStanModel, CmdStanMCMC
 
-from .data_loading import load_detector_csvs
+from ..data.data_loading import load_detector_csvs
 # Ensure this matches your actual filename. 
 # If you created a new file for HSGP, update this import (e.g. .prepare_stan_data_hsgp).
 # If you edited the existing file, keep it as is.

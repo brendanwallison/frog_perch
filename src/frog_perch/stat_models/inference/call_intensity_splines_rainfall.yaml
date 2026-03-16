@@ -1,27 +1,34 @@
-csv_dir: /home/breallis/datasets/frog_calls/gabon_full/P2_slice_out
-rain_csv: /home/breallis/datasets/frog_calls/gabon_rainfall_2024_full.csv
-# Ensure this points to the new Spline Stan file we created
-output_dir: stat_results/call_intensity_spline_rainfall_v7
+# ---------------------------------------------------------
+# Data Paths
+# ---------------------------------------------------------
+# Points to the new 5-second window features (nn_mu, nn_var, RMS)
+csv_dir: /home/breallis/datasets/frog_calls/gabon_full/P2_nn_features
 
+# Rainfall covariate data
+rain_csv: /home/breallis/datasets/frog_calls/gabon_rainfall_2024_full.csv
+
+# The parameters learned by the MLE calibration script
+calibration_json_path: /home/breallis/dev/frog_perch/checkpoints/pool=slice_loss=slice_x0=-3.0_k=1.0.keras_multiband_calibration_calibrated_v2.json
+
+# Output directory for the ArviZ inference data
+output_dir: stat_results/call_intensity_spline_rainfall_calibrated_v2
+
+# ---------------------------------------------------------
 # MCMC Settings
+# ---------------------------------------------------------
 warmup: 250
 sampling: 1000
-chains: 2
+chains: 1
 seed: 20250101
 
-# Aggregation Settings (Likelihood Profile)
-bin_duration_sec: 0.3125   # Sub-second bin size
-window_length_sec: 5.0     # Analysis window length
+# ---------------------------------------------------------
+# Aggregation & Spline Settings
+# ---------------------------------------------------------
+# Sub-second bin size is mostly vestigial now but kept for script signature compatibility
+bin_duration_sec: 0.3125   
+window_length_sec: 5.0     
 
 # Spline Complexity Settings
-# Replaces M_season/M_diel. 
 # Smaller spacing = More knots = Higher flexibility.
 knot_spacing_diel_min: 10.0     # Knot every 10 minutes
 burn_in_days: 30
-
-# Calibration (Beta Distribution Params)
-# Defaults based on previous discussions
-a_call: 3.0
-b_call: 1.0
-a_bg: 1.0
-b_bg: 5.0

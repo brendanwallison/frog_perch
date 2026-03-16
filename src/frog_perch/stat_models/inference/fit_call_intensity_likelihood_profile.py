@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any, Tuple
 from cmdstanpy import CmdStanModel, CmdStanMCMC
 import pandas as pd
 
-from .data_loading import load_detector_csvs
+from ..data.data_loading import load_detector_csvs
 # Ensure this filename matches where you saved the preprocessing script
 from .prepare_stan_data_likelihood_profile import prepare_stan_data_vectorized as prepare_stan_data
 

@@ -13,7 +13,7 @@ from frog_perch.metrics.count_metrics import (
 # Pure-TensorFlow soft count distribution
 # ------------------------------------------------------------
 
-def tf_soft_count_distribution(weights, max_bin=4):
+def tf_soft_count_distribution(weights, max_bin=16):
     """
     Pure TF version of soft_count_distribution.
     weights: [T] probabilities
@@ -48,7 +48,7 @@ def tf_soft_count_distribution(weights, max_bin=4):
 # Pure-TensorFlow soft count distribution via scan, T=16 fixed
 # ------------------------------------------------------------
 
-def tf_soft_count_distribution_batch(weights, max_bin=4, expected_T=16):
+def tf_soft_count_distribution_batch(weights, max_bin=16, expected_T=16):
     """
     weights: [B, T] probabilities, with static T=expected_T
     returns: [B, max_bin+1] soft count distributions
@@ -98,12 +98,12 @@ def tf_soft_count_distribution_batch(weights, max_bin=4, expected_T=16):
     return dp_final  # [B, max_bin+1]
 
 
-def slices_to_soft_counts(slice_logits, max_bin=4, expected_T=16):
+def slices_to_soft_counts(slice_logits, max_bin=16, expected_T=16):
     slice_probs = tf.nn.sigmoid(slice_logits)  # [B, T]
     return tf_soft_count_distribution_batch(slice_probs, max_bin=max_bin, expected_T=expected_T)
 
 
-def targets_to_soft_counts(slice_targets, max_bin=4, expected_T=16):
+def targets_to_soft_counts(slice_targets, max_bin=16, expected_T=16):
     return tf_soft_count_distribution_batch(slice_targets, max_bin=max_bin, expected_T=expected_T)
 
 
@@ -116,7 +116,7 @@ class SliceToCountWrapper(tf.keras.metrics.Metric):
     """
     Wraps a clip-level metric so it can be applied to slice-level logits.
     """
-    def __init__(self, base_metric, max_bin=4, name=None, **kwargs):
+    def __init__(self, base_metric, max_bin=16, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.base_metric = base_metric
         self.max_bin = max_bin
@@ -186,7 +186,7 @@ class SliceToCountKLDivergence(tf.keras.metrics.Metric):
     KL divergence between soft count distributions derived from slice logits.
     """
 
-    def __init__(self, max_bin=4, name="slice2count_kl", **kwargs):
+    def __init__(self, max_bin=16, name="slice2count_kl", **kwargs):
         super().__init__(name=name, **kwargs)
         self.max_bin = max_bin
         self.kl = tf.keras.losses.KLDivergence()
@@ -215,35 +215,35 @@ class SliceToCountKLDivergence(tf.keras.metrics.Metric):
 # Wrapped versions of your existing clip-level metrics
 # ------------------------------------------------------------
 
-def SliceExpectedCountMAE(max_bin=4):
+def SliceExpectedCountMAE(max_bin=16):
     return SliceToCountWrapper(
         base_metric=ExpectedCountMAE(),
         max_bin=max_bin,
         name="slice2count_expected_count_mae"
     )
 
-def SliceEMD(max_bin=4):
+def SliceEMD(max_bin=16):
     return SliceToCountWrapper(
         base_metric=EMD(),
         max_bin=max_bin,
         name="slice2count_emd"
     )
 
-def SliceExpectedRecall(max_bin=4):
+def SliceExpectedRecall(max_bin=16):
     return SliceToCountWrapper(
         base_metric=ExpectedRecall(),
         max_bin=max_bin,
         name="slice2count_expected_recall"
     )
 
-def SliceExpectedPrecision(max_bin=4):
+def SliceExpectedPrecision(max_bin=16):
     return SliceToCountWrapper(
         base_metric=ExpectedPrecision(),
         max_bin=max_bin,
         name="slice2count_expected_precision"
     )
 
-def SliceExpectedBinaryAccuracy(max_bin=4):
+def SliceExpectedBinaryAccuracy(max_bin=16):
     return SliceToCountWrapper(
         base_metric=ExpectedBinaryAccuracy(),
         max_bin=max_bin,
@@ -255,7 +255,7 @@ def SliceExpectedBinaryAccuracy(max_bin=4):
 # Loss terms
 # ------------------------------------------------------------
 
-def soft_count_kl_loss(y_true_slices, y_pred_logits, max_bin=4):
+def soft_count_kl_loss(y_true_slices, y_pred_logits, max_bin=16):
     """
     y_true_slices: [B, T] slice-level soft labels
     y_pred_logits: [B, T] logits
@@ -277,7 +277,7 @@ def soft_count_kl_loss(y_true_slices, y_pred_logits, max_bin=4):
     return tf.reduce_mean(kl)
 
 class SliceLossWithSoftCountKL(tf.keras.losses.Loss):
-    def __init__(self, max_bin=4, kl_weight=1.0, name="slice_bce_plus_kl", **kwargs):
+    def __init__(self, max_bin=16, kl_weight=2.0, name="slice_bce_plus_kl", **kwargs):
         super().__init__(name=name)
         self.max_bin = max_bin
         self.kl_weight = kl_weight

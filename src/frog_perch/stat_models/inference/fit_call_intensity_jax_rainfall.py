@@ -5,12 +5,13 @@ import argparse
 import shutil  # NEW: for copying config
 from pathlib import Path
 import yaml
+import json
 import numpy as np
 import arviz as az
 import pandas as pd
 
 # 1. Load Utilities
-from frog_perch.stat_models.inference.data_loading import load_detector_csvs
+from frog_perch.stat_models.data.data_loading import load_detector_csvs
 from frog_perch.stat_models.data.data_prep_for_rainfall_model import prepare_stan_data_hydrological
 from frog_perch.stat_models.numpyro.call_intensity_profile_rain_hill import compile_and_run
 
@@ -20,7 +21,16 @@ def load_config(path):
 
 def main():
     parser = argparse.ArgumentParser(description="Run JAX Call-Intensity Rain Model")
-    parser.add_argument("--config", type=Path, required=True, help="Path to YAML config")
+    
+    # Define your default config path here
+    default_config = Path("/home/breallis/dev/frog_perch/src/frog_perch/stat_models/inference/call_intensity_splines_rainfall.yaml") # Update this to your actual default path!
+    
+    parser.add_argument(
+        "--config", 
+        type=Path, 
+        default=default_config, 
+        help=f"Path to YAML config (default: {default_config})"
+    )
     args = parser.parse_args()
     
     cfg = load_config(args.config)
@@ -29,6 +39,7 @@ def main():
     csv_dir = Path(cfg["csv_dir"])
     rain_path = Path(cfg["rain_csv"])
     output_dir = Path(cfg["output_dir"])
+    calibration_json_path = Path(cfg["calibration_json_path"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # NEW: Copy config file to output directory for reproducibility
@@ -41,14 +52,15 @@ def main():
     print(f"🌧️ Loading rainfall data from {rain_path}...")
     df_rain = pd.read_csv(rain_path)
     
+    print(f"⚙️ Loading calibration parameters from {calibration_json_path}...")
+    with open(calibration_json_path, 'r') as f:
+        calib_params = json.load(f)
+    
     print("🛠️ Preparing Hydrological Decay data...")
     stan_data, windows_df, params = prepare_stan_data_hydrological(
         df_raw,
         df_rain,
-        a_call=cfg["a_call"], 
-        b_call=cfg["b_call"],
-        a_bg=cfg["a_bg"],     
-        b_bg=cfg["b_bg"],
+        calibration_params=calib_params,
         bin_duration_sec=cfg["bin_duration_sec"],
         window_length_sec=cfg["window_length_sec"],
         knot_spacing_diel_min=cfg["knot_spacing_diel_min"],

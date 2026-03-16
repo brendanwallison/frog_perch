@@ -61,6 +61,12 @@ def reconstruct_wetness_recursive(precip, hl):
         w[t] = phi * w[t - 1] + (1 - phi) * precip[t]
     return w
 
+def iterate_draws(idata):
+    post = idata.posterior
+    for c in range(post.sizes["chain"]):
+        for d in range(post.sizes["draw"]):
+            yield {k: post[k].values[c, d] for k in post.data_vars}
+
 def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
     """
     Vectorizes reconstruction for EVERY day in the sim timeline (110 days),
@@ -197,7 +203,7 @@ def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
         wf = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_fast"))
         ws = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_slow"))
         ks = get_param(d, "k_slow")
-        ns = get_param(d, "n_slow")
+        ns = get_param(d, "n_slow_val") # CORRECTED
 
         sat = (ws ** ns) / (ks ** ns + ws ** ns)
         wf_l.append(wf); ws_l.append(ws); sat_l.append(sat)
@@ -236,35 +242,33 @@ def plot_mcmc_health(idata, output_dir):
     az.plot_rank(idata, var_names=vars, kind="vlines"); plt.savefig(Path(output_dir) / "rank_plot.png"); plt.close()
     az.summary(idata, var_names=vars).to_csv(Path(output_dir) / "mcmc_summary.csv")
 
-def iterate_draws(idata):
-    post = idata.posterior
-    for c in range(post.sizes["chain"]):
-        for d in range(post.sizes["draw"]):
-            yield {k: post[k].values[c, d] for k in post.data_vars}
-
 def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
     all_t = []
     for draw in iterate_draws(idata):
         wf = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_fast"))
         ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
-        r_f = get_param(draw, "gamma_fast") * (wf/(np.std(wf)+1e-6) - np.mean(wf/(np.std(wf)+1e-6)))
-        r_s = get_param(draw, "gamma_slow") * (
-            ws/(get_param(draw, "k_slow")+ws) 
-            - np.mean(ws/(get_param(draw, "k_slow")+ws))
-        )
-    all_t.append(r_f + r_s)
+        
+        wf_std = wf / (np.std(wf) + 1e-6)
+        r_f = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
+        
+        ks = get_param(draw, "k_slow")
+        ns = get_param(draw, "n_slow_val")
+        ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
+        
+        r_s = get_param(draw, "gamma_slow") * (ws_hill - np.mean(ws_hill))
+        all_t.append(r_f + r_s)
+        
     mu, lo, hi = np.mean(all_t, 0), np.percentile(all_t, 2.5, 0), np.percentile(all_t, 97.5, 0)
     plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu)
     plt.fill_between(viz_meta["full_calendar"], lo, hi, alpha=0.2)
     plt.title("Total Rain Influence (Full Timeline)"); plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
-
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_v8"),
+        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_calibrated_v1"),
         help="Directory containing inference outputs (default: current directory)"
     )
     args = parser.parse_args()

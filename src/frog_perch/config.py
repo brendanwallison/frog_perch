@@ -16,17 +16,17 @@ CLIP_DURATION_SECONDS = PERCH_CLIP_SECONDS  # we use 5s windows for sampling
 Q2_CONFIDENCE = 1.0
 
 # Sampling / metadata
-TEST_SPLIT = 0.3
+TEST_SPLIT = 0.15
 POS_RATIO = 0.5
-RANDOM_SEED = 42
+RANDOM_SEED = 41
 METADATA_WORKERS = 8  # threads for metadata creation
 
 # Training defaults
 BATCH_SIZE = 16
-EPOCHS = 50
-LEARNING_RATE = 1e-5
+EPOCHS = 10
+LEARNING_RATE = 1e-4
 LABEL_MODE = 'slice'  # 'binary' or 'count'
-STEPS_PER_EPOCH = 250
+STEPS_PER_EPOCH = 50
 
 # Validation defaults
 VAL_STRIDE_SEC = 1

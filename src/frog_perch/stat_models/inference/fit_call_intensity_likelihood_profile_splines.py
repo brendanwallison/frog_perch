@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any, Tuple
 from cmdstanpy import CmdStanModel, CmdStanMCMC
 import pandas as pd
 
-from .data_loading import load_detector_csvs
+from ..data.data_loading import load_detector_csvs
 # UPDATED: Import the spline preprocessing function
 # Ensure the file from the previous step is saved as 'prepare_stan_data_splines.py'
 from .prepare_stan_data_likelihood_profile_splines import prepare_stan_data_splines as prepare_stan_data

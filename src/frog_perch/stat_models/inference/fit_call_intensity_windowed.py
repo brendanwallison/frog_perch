@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any
 
 from cmdstanpy import CmdStanModel, CmdStanMCMC
 
-from .data_loading import load_detector_csvs
+from ..data.data_loading import load_detector_csvs
 # Point this to wherever you saved the windowed data prep logic.
 # If you overwrote prepare_stan_data.py, this is correct.
 from .prepare_stan_data_windowed import prepare_stan_data

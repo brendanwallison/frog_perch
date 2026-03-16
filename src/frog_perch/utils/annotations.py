@@ -43,7 +43,7 @@ def annotation_confidence_from_features(duration,
                                         duration_stats=None,
                                         bandwidth_stats=None,
                                         combine='mean',
-                                        k=1.0, x0=0.0,
+                                        k=1.0, x0=-3.0,
                                         lower=0.01, upper=0.99,
                                         clip_z=5.0):
     """
@@ -132,7 +132,7 @@ def load_annotations(annotation_dir, audio_file):
 def compute_annotation_confidence(
     row,
     q2_confidence: float = 0.75,
-    use_continuous_confidence: bool = False,
+    use_continuous_confidence: bool = True,
     duration_stats=None,
     bandwidth_stats=None,
     logistic_params: dict = None,
@@ -189,8 +189,8 @@ def slice_binary_confidences(
     clip_start,
     clip_end,
     n_slices=16,
-    q2_confidence=0.75,
-    use_continuous_confidence=False,
+    q2_confidence=1,
+    use_continuous_confidence=True,
     duration_stats=None,
     bandwidth_stats=None,
     logistic_params=None,
@@ -242,6 +242,79 @@ def slice_binary_confidences(
 
     return out
 
+def get_detailed_frog_call_metadata(
+    annotations,
+    clip_start,
+    clip_end,
+    **conf_params
+) -> List[dict]:
+    """
+    Internal helper to get weights AND centroids for each call in a window.
+    """
+    calls = []
+    for _, row in annotations.iterrows():
+        if 'white dot' not in str(row.get('Annotation', '')).lower():
+            continue
+        
+        w = compute_annotation_confidence(row=row, **conf_params)
+        
+        ann_start = float(row['Begin Time (s)'])
+        ann_end = float(row['End Time (s)'])
+        actual_start = max(clip_start, ann_start)
+        actual_end = min(clip_end, ann_end)
+        
+        if actual_start < actual_end and w > 0:
+            centroid = (actual_start + actual_end) / 2.0
+            calls.append({'weight': w, 'center': centroid})
+    return calls
+
+def reconciled_slice_and_count_targets(
+    annotations,
+    clip_start,
+    clip_end,
+    n_slices=16,
+    max_count_bin=16,
+    **conf_params
+):
+    """
+    Generates a unified ground truth vector where slice-level placement 
+    and window-level count distribution are mathematically reconciled.
+    """
+    # 1. Extract metadata
+    calls = get_detailed_frog_call_metadata(annotations, clip_start, clip_end, **conf_params)
+    weights = [c['weight'] for c in calls]
+
+    # 2. Slice Allocation (Nearest-Available Neighbor)
+    slice_dur = (clip_end - clip_start) / n_slices
+    slice_probs = np.zeros(n_slices, dtype=np.float32)
+
+    # Sort by confidence to ensure 'anchor' frogs get priority
+    calls_sorted = sorted(calls, key=lambda x: x['weight'], reverse=True)
+
+    for call in calls_sorted:
+        rel_pos = (call['center'] - clip_start) / slice_dur
+        ideal_idx = int(np.clip(np.floor(rel_pos), 0, n_slices - 1))
+        
+        if slice_probs[ideal_idx] == 0:
+            slice_probs[ideal_idx] = call['weight']
+        else:
+            # Conflict! Find closest empty neighbor
+            found = False
+            for offset in range(1, n_slices):
+                fractional = rel_pos - ideal_idx
+                preferred_dirs = [1, -1] if fractional >= 0.5 else [-1, 1]
+                for d in preferred_dirs:
+                    neighbor_idx = ideal_idx + (offset * d)
+                    if 0 <= neighbor_idx < n_slices and slice_probs[neighbor_idx] == 0:
+                        slice_probs[neighbor_idx] = call['weight']
+                        found = True
+                        break
+                if found: break
+
+    # 3. Generate the Count Distribution (Gold Standard Variance)
+    count_dist = soft_count_distribution(weights, max_bin=max_count_bin)
+
+    return slice_probs, count_dist
 
 # ---------------------------------------------------------------------
 # Clip-level confidence
@@ -258,30 +331,36 @@ def has_frog_call(
     logistic_params: dict = None,
 ):
     """
-    Compute clip-level confidence that a frog call occurs within the window.
+    Compute clip-level probability that at least one frog call
+    occurs within the window.
 
-    The score is:
-        max_over_annotations( overlap_fraction * annotation_confidence )
+    The probability is:
+
+        1 - product_over_annotations(1 - overlap_fraction * annotation_confidence)
 
     where overlap_fraction = overlap_duration / annotation_duration.
 
-    Parameters
-    ----------
-    annotations : pandas.DataFrame
-        Annotation table.
-    clip_start, clip_end : float
-        Window bounds.
-    q2_confidence, use_continuous_confidence, duration_stats, bandwidth_stats, logistic_params
-        Passed through to `compute_annotation_confidence`.
+    This assumes:
+        - Independent annotation existence events
+        - Uniform call placement within annotation duration
 
     Returns
     -------
     float
-        Confidence in [0,1].
+        Probability in [0,1].
     """
-    max_score = 0.0
+
+    clip_start = float(clip_start)
+    clip_end = float(clip_end)
+
+    if clip_end <= clip_start:
+        return 0.0
+
+    # Accumulate probabilities of each overlapping annotation
+    probs = []
 
     for _, row in annotations.iterrows():
+
         if 'white' not in str(row.get('Annotation', '')).lower():
             continue
 
@@ -308,10 +387,22 @@ def has_frog_call(
             logistic_params=logistic_params,
         )
 
-        score = fraction * confidence
-        max_score = max(max_score, score)
+        p_j = fraction * confidence
 
-    return max_score
+        # Clamp for numerical safety
+        p_j = float(np.clip(p_j, 0.0, 1.0))
+
+        probs.append(p_j)
+
+    if not probs:
+        return 0.0
+
+    # Union probability: 1 - ∏ (1 - p_j)
+    no_call_prob = 1.0
+    for p in probs:
+        no_call_prob *= (1.0 - p)
+
+    return float(1.0 - no_call_prob)
 
 
 # ---------------------------------------------------------------------

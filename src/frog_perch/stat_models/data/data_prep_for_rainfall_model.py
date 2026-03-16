@@ -3,28 +3,10 @@ import pandas as pd
 import numpy as np
 import pickle
 from pathlib import Path
-from scipy.stats import beta
 from patsy import dmatrix
 
-# ---------------------------------------------------------------------
-# Calibration & Likelihood Utilities (Unchanged)
-# ---------------------------------------------------------------------
-def compute_log_odds(p, a_call, b_call, a_bg, b_bg):
-    log_f_call = beta.logpdf(p, a_call, b_call)
-    log_f_bg   = beta.logpdf(p, a_bg, b_bg)
-    return log_f_call - log_f_bg
-
-def batch_likelihood_vectors(ell_matrix: np.ndarray) -> np.ndarray:
-    n_windows, n_bins = ell_matrix.shape
-    w_obs = np.zeros((n_windows, n_bins + 1))
-    for i in range(n_windows):
-        L_log_odds = ell_matrix[i] 
-        pgf = np.array([1.0])
-        for l in L_log_odds:
-            Lambda = np.exp(l)
-            pgf = np.convolve(pgf, [1.0, Lambda])
-        w_obs[i, :] = pgf / np.sum(pgf)
-    return w_obs
+# IMPORT THE SINGLE SOURCE OF TRUTH
+from frog_perch.nn_calibration.sensor_model import calculate_likelihood_vector
 
 def build_spline_basis(x, step_size, hard_bounds=None):
     if hard_bounds:
@@ -45,9 +27,9 @@ def build_spline_basis(x, step_size, hard_bounds=None):
 def prepare_stan_data_hydrological(
     df: pd.DataFrame,
     df_rain: pd.DataFrame,
+    calibration_params: dict, 
     *,
-    a_call: float, b_call: float, a_bg: float, b_bg: float,
-    bin_duration_sec: float = 0.2,
+    bin_duration_sec: float = 0.2, # Kept for signature compatibility
     window_length_sec: float = 5.0,
     knot_spacing_diel_min: float = 10.0,
     burn_in_days: int = 14,
@@ -59,35 +41,42 @@ def prepare_stan_data_hydrological(
             return pickle.load(f)
 
     # --- 1. Audio Data Prep ---
-    df = df.copy().dropna(subset=["prob", "datetime"])
+    df = df.copy().dropna(subset=["nn_mu", "nn_var", "datetime"])
     df["datetime"] = pd.to_datetime(df["datetime"])
-    df["ell"] = compute_log_odds(df["prob"].to_numpy(), a_call, b_call, a_bg, b_bg)
     df = df.sort_values("datetime").reset_index(drop=True)
     
     df["time_of_day_hours"] = df["datetime"].dt.hour + df["datetime"].dt.minute / 60.0 + df["datetime"].dt.second / 3600.0
     df = df[(df["time_of_day_hours"] >= 17.0) & (df["time_of_day_hours"] <= 23.0)]
 
-    # --- 2. Window Generation ---
-    bins_per_window = int(window_length_sec / bin_duration_sec)
-    ell_matrix, t_mid_list, window_metadata = [], [], []
+    # --- 2. Window Generation (Using Shared Math) ---
+    t_mid_list = []
+    window_metadata = []
+    w_obs_list = []
+    
+    k_max = calibration_params.get("K_MAX", 16.0)
+    x_center = calibration_params.get("x_interf_center_mean", 0.0)
 
-    for start_idx in range(0, len(df), bins_per_window):
-        end_idx = start_idx + bins_per_window
-        if end_idx > len(df): break 
-        window_df = df.iloc[start_idx:end_idx]
-        
-        if not np.allclose(np.diff(window_df["datetime"].astype("int64") / 1e9), bin_duration_sec, atol=0.01):
-            continue  
-
-        ell_matrix.append(window_df["ell"].to_numpy())
-        t_mid = 0.5 * (window_df["time_of_day_hours"].iloc[0] + window_df["time_of_day_hours"].iloc[-1])
+    for idx, row in df.iterrows():
+        t_mid = row["time_of_day_hours"]
         t_mid_list.append(t_mid)
         window_metadata.append({
-            "start_time": window_df["datetime"].iloc[0],
+            "start_time": row["datetime"],
             "mid_time_hour": t_mid
         })
+        
+        # Extract features
+        x_interf = row['log_mean_rms_1000_1500'] - x_center
+        y_mu_norm = np.clip(row['nn_mu'] / k_max, 0.001, 0.999)
+        norm_factor = (y_mu_norm * (1.0 - y_mu_norm)) + 1e-6
+        nu_obs = (row['nn_var'] / (k_max**2)) / norm_factor
+        
+        # Get 17-bin probability vector via imported function
+        lik_vec = calculate_likelihood_vector(
+            row['nn_mu'], nu_obs, x_interf, calibration_params, k_max
+        )
+        w_obs_list.append(lik_vec)
 
-    w_obs = batch_likelihood_vectors(np.stack(ell_matrix))
+    w_obs = np.stack(w_obs_list)
 
     # --- 3. Chronological Rainfall & Burn-in ---
     audio_start = window_metadata[0]["start_time"].normalize()
@@ -159,7 +148,7 @@ def prepare_stan_data_hydrological(
 
     stan_data = {
         "T": len(w_obs),
-        "N": bins_per_window,
+        "N": int(k_max),
         "w_obs": w_obs,
         "K_diel": K_diel,
         "B_diel": B_diel,

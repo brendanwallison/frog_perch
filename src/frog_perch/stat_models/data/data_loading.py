@@ -17,7 +17,6 @@ def extract_start_datetime(path: Path) -> datetime | None:
     ymd, hms = m.group(1), m.group(2)
     return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S")
 
-
 # ------------------------------------------------------------
 # 1. Load and merge all detector CSVs
 # ------------------------------------------------------------
@@ -25,23 +24,26 @@ def extract_start_datetime(path: Path) -> datetime | None:
 def load_detector_csvs(csv_dir: Path) -> pd.DataFrame:
     """
     Read all detector CSVs in a directory, attach absolute timestamps,
-    and return a tidy DataFrame ready for Stan preprocessing.
-
-    Expected CSV columns:
-        time_sec, prob, n_eff, var
-    Only time_sec and prob are used.
+    and return a tidy DataFrame ready for calibration and Stan preprocessing.
+    
+    Preserves all extracted features (nn_mu, nn_var, covariates, etc.).
     """
     rows = []
+    csv_paths = list(Path(csv_dir).glob("*.csv"))
 
-    for path in sorted(csv_dir.glob("*.csv")):
+    if not csv_paths:
+        raise RuntimeError(f"No CSVs found in {csv_dir}")
+
+    for path in sorted(csv_paths):
         start_dt = extract_start_datetime(path)
         if start_dt is None:
             continue  # skip files without valid timestamp
 
         df = pd.read_csv(path)
 
-        # Keep only needed columns
-        df = df[["time_sec", "prob"]].copy()
+        if "time_sec" not in df.columns:
+            print(f"[WARN] Skipping {path.name}: missing 'time_sec' column.")
+            continue
 
         # Compute absolute timestamps
         df["datetime"] = df["time_sec"].apply(
@@ -57,12 +59,11 @@ def load_detector_csvs(csv_dir: Path) -> pd.DataFrame:
             + df["datetime"].dt.second / 3600
         )
 
-        df["path"] = str(path)
-
+        df["source_file"] = path.name
         rows.append(df)
 
     if not rows:
-        raise RuntimeError(f"No valid CSVs found in {csv_dir}")
+        raise RuntimeError(f"No valid data could be loaded from CSVs in {csv_dir}")
 
     out = pd.concat(rows, ignore_index=True)
 
