@@ -54,12 +54,13 @@ class SoftCountFromSlices(layers.Layer):
 
 def build_downstream(
     spatial_shape=(16, 4, 1536),
-    slice_hidden_dims=(512, 128),  # Adjust this tuple to experiment with dimensionality reduction
+    slice_hidden_dims=(1024, 512),  
     temporal_dim=128,
     num_temporal_layers=2,
     kernel_size=3,
+    activation="gelu",
     dropout=0.1,
-    l2_reg=1e-4,                   # NEW: L2 weight decay parameter
+    l2_reg=1e-4,                   
     use_gating=False,
     max_bin=16,
 ):
@@ -85,7 +86,7 @@ def build_downstream(
         x = layers.TimeDistributed(
             layers.Dense(
                 dim, 
-                activation="relu",
+                activation=activation,
                 kernel_regularizer=regularizers.l2(l2_reg)
             )
         )(x)
@@ -95,7 +96,7 @@ def build_downstream(
     x = layers.TimeDistributed(
         layers.Dense(
             temporal_dim, 
-            activation="relu",
+            activation=activation,      # UPDATED
             kernel_regularizer=regularizers.l2(l2_reg)
         )
     )(x)
@@ -115,7 +116,7 @@ def build_downstream(
             filters=temporal_dim,
             kernel_size=kernel_size,
             padding="same",
-            activation="relu",
+            activation=activation,
             kernel_regularizer=regularizers.l2(l2_reg)
         )(res_inp)
 
@@ -126,7 +127,7 @@ def build_downstream(
                 filters=temporal_dim,
                 kernel_size=kernel_size,
                 padding="same",
-                activation="sigmoid",
+                activation="sigmoid",   # sigmoid for gating logic [0, 1]
                 kernel_regularizer=regularizers.l2(l2_reg)
             )(res_inp)
             x = layers.Add()([x, layers.Multiply()([gate, h])])

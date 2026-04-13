@@ -1,15 +1,36 @@
+import yaml
+from pathlib import Path
 from src.frog_perch.nn_training.train import train
 import configs.nn_config as config
 
+def load_normalization_stats(yaml_path: str) -> dict:
+    """Safely load the generated normalization stats."""
+    try:
+        with open(yaml_path, 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Could not find {yaml_path}. Have you run the normalization script yet?"
+        )
+
 if __name__ == '__main__':
-    # The updated train function now returns the model, 
-    # the validation dataset (for calibration), 
-    # and the test results (for final reporting).
-    model, val_ds = train(
-        epochs=config.EPOCHS,
-        batch_size=config.BATCH_SIZE
-    )
+    # 1. Grab your static config
+    experiment_config = {
+        key: value for key, value in vars(config).items() 
+        if key.isupper()
+    }
     
-    # Optional: If you want to use the model immediately for 
-    # validation-based calibration, you have val_ds ready here.
-    print("Pipeline complete. Model is ready for inference or calibration.")
+    # 2. Load your dynamic stats
+    # (Assuming normalization.yaml is in the same folder as config.py)
+    config_dir = Path(config.__file__).parent
+    norm_stats = load_normalization_stats(config_dir / "normalization.yaml")
+    
+    # 3. Assemble the final CONFIDENCE_PARAMS dictionary
+    experiment_config["CONFIDENCE_PARAMS"] = {
+        "duration_stats": norm_stats.get("duration", {}),
+        "bandwidth_stats": norm_stats.get("bandwidth", {}),
+        "logistic_params": experiment_config.get("CONFIDENCE_LOGISTIC_PARAMS", {})
+    }
+    
+    # 4. Train!
+    model, val_ds = train(experiment_config)

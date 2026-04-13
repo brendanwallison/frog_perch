@@ -59,7 +59,6 @@ def _val_python_gen(dataset_obj):
             np.int32(start),
         )
 
-
 # Builders
 def build_tf_dataset(dataset_obj, batch_size):
     """
@@ -103,12 +102,12 @@ def build_tf_dataset(dataset_obj, batch_size):
             output_signature=output_signature,
         )
         .map(lambda s, l, a, b: (s, l), num_parallel_calls=tf.data.AUTOTUNE)
+        .repeat()  # Explicitly tells Keras to loop this dataset infinitely across epochs
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
     )
 
     return ds
-
 
 def build_tf_val_dataset(dataset_obj, batch_size):
     """

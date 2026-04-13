@@ -5,7 +5,6 @@ import tensorflow as tf
 
 from frog_perch.datasets.frog_dataset import FrogPerchDataset
 from frog_perch.nn_models.downstream import build_downstream
-import frog_perch.config as config
 from frog_perch.nn_training.dataset_builders import build_tf_dataset, build_tf_val_dataset
 
 
@@ -49,47 +48,6 @@ class LossAnnealingCallback(tf.keras.callbacks.Callback):
         
         print(f"\n[ANNEAL] binary_weight: {new_bin:.4f} | slice_weight: {new_slice:.4f}")
 
-@tf.keras.utils.register_keras_serializable(package="frog_perch")
-class CountKLDivergence(tf.keras.metrics.Metric):
-    """
-    Stable KL divergence metric for distribution outputs.
-    Always executes under both eager + graph mode.
-    """
-
-    def __init__(self, name="count_kl", **kwargs):
-        super().__init__(name=name, **kwargs)
-
-        self.kl_sum = self.add_weight(name="kl_sum", initializer="zeros")
-        self.count_probs = self.add_weight(name="count_probs", initializer="zeros")
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-
-        # Normalize defensively (prevents silent NaN / skip behavior)
-        y_true = y_true / tf.reduce_sum(y_true, axis=-1, keepdims=True)
-        y_pred = y_pred / tf.reduce_sum(y_pred, axis=-1, keepdims=True)
-
-        kl = tf.reduce_sum(
-            y_true * tf.math.log(tf.maximum(y_true, 1e-8) / tf.maximum(y_pred, 1e-8)),
-            axis=-1,
-        )
-
-        if sample_weight is not None:
-            sample_weight = tf.cast(sample_weight, tf.float32)
-            kl = kl * sample_weight
-            self.count_probs.assign_add(tf.reduce_sum(sample_weight))
-        else:
-            self.count_probs.assign_add(tf.cast(tf.shape(kl)[0], tf.float32))
-
-        self.kl_sum.assign_add(tf.reduce_sum(kl))
-
-    def result(self):
-        return tf.math.divide_no_nan(self.kl_sum, self.count_probs)
-
-    def reset_state(self):
-        self.kl_sum.assign(0.0)
-        self.count_probs.assign(0.0)
 
 @tf.keras.utils.register_keras_serializable(package="frog_perch")
 class AnnealedLossWrapper(tf.keras.losses.Loss):
@@ -176,24 +134,32 @@ def inspect_ds(ds_obj: FrogPerchDataset, name: str) -> None:
     print(f"Max expected events:  {expected_counts.max():.4f}")
 
 
-def train(
-    epochs: int = config.EPOCHS,
-    batch_size: int = config.BATCH_SIZE,
-    val_stride: float = getattr(config, "VAL_STRIDE_SEC", 1.0),
-    steps_per_epoch: int = getattr(config, "STEPS_PER_EPOCH", 100),
-    confidence_params: dict = getattr(config, "CONFIDENCE_PARAMS", None),
-) -> tuple[tf.keras.Model, tf.data.Dataset]:
-    if confidence_params is None:
-        confidence_params = {}
+def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
+    """
+    Trains the downstream frog perch model using a configuration dictionary.
+    """
+    # 1. Extract hyperparameters with sensible defaults
+    epochs = cfg.get("EPOCHS", 100)
+    batch_size = cfg.get("BATCH_SIZE", 32)
+    val_stride = cfg.get("VAL_STRIDE_SEC", 1.0)
+    steps_per_epoch = cfg.get("STEPS_PER_EPOCH", 100)
+    confidence_params = cfg.get("CONFIDENCE_PARAMS", {})
+    max_bin = cfg.get("MAX_BIN", 16)
 
+    # 2. Setup Dataset arguments
     dataset_kwargs = dict(
-        audio_dir=config.AUDIO_DIR,
-        annotation_dir=config.ANNOTATION_DIR,
-        random_seed=config.RANDOM_SEED,
+        audio_dir=cfg["AUDIO_DIR"],             # Required (Throws error if missing)
+        annotation_dir=cfg["ANNOTATION_DIR"],   # Required
+        random_seed=cfg.get("RANDOM_SEED", 42),
         confidence_params=confidence_params,
     )
 
-    train_ds_obj = FrogPerchDataset(split_type='train', pos_ratio=config.POS_RATIO, **dataset_kwargs)
+    # 3. Build Datasets
+    train_ds_obj = FrogPerchDataset(
+        split_type='train', 
+        pos_ratio=cfg.get("POS_RATIO", 0.5), 
+        **dataset_kwargs
+    )
     val_ds_obj   = FrogPerchDataset(split_type='val', val_stride_sec=val_stride, **dataset_kwargs)
     test_ds_obj  = FrogPerchDataset(split_type='test', val_stride_sec=val_stride, **dataset_kwargs)
 
@@ -204,19 +170,21 @@ def train(
     inspect_ds(val_ds_obj, "VALIDATION")
     inspect_ds(test_ds_obj, "TEST")
 
+    # 4. Build Model
     model = build_downstream(
-        spatial_shape=getattr(config, "SPATIAL_SHAPE", (16, 4, 1536)),
-        slice_hidden_dims=getattr(config, "SLICE_HIDDEN_DIMS", (512, 256)),
-        temporal_dim=getattr(config, "TEMPORAL_DIM", 256),
-        num_temporal_layers=getattr(config, "NUM_TEMPORAL_LAYERS", 2),
-        kernel_size=getattr(config, "KERNEL_SIZE", 3),
-        dropout=getattr(config, "DROPOUT", 0.1),
-        l2_reg=getattr(config, "L2_REG", 1e-2),
-        use_gating=getattr(config, "USE_GATING", True),
-        max_bin=16
+        spatial_shape=cfg.get("SPATIAL_SHAPE", (16, 4, 1536)),
+        slice_hidden_dims=cfg.get("SLICE_HIDDEN_DIMS", (512, 256)),
+        temporal_dim=cfg.get("TEMPORAL_DIM", 256),
+        num_temporal_layers=cfg.get("NUM_TEMPORAL_LAYERS", 2),
+        kernel_size=cfg.get("KERNEL_SIZE", 3),
+        activation=cfg.get("ACTIVATION", "gelu"),
+        dropout=cfg.get("DROPOUT", 0.1),
+        l2_reg=cfg.get("L2_REG", 1e-2),
+        use_gating=cfg.get("USE_GATING", True),
+        max_bin=max_bin
     )
 
-    # Define dynamic weights
+    # 5. Define dynamic weights
     weight_binary = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="weight_binary")
     weight_slice = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="weight_slice")
 
@@ -232,7 +200,6 @@ def train(
             weight_slice, 
             name="annealed_slice"
         ),
-        # "count_probs": NormalizedEarthMoversDistance1D(),
         "count_probs": tf.keras.losses.KLDivergence(),
     }
 
@@ -243,25 +210,29 @@ def train(
         ],
         "slice_logits": [
             tf.keras.metrics.BinaryAccuracy(name="slice_acc", threshold=0.0),
-            # FIX: Use the native from_logits argument
             tf.keras.metrics.AUC(name="slice_auc", from_logits=True), 
         ],
         "count_probs": [
             tf.keras.losses.KLDivergence(),
-            ExpectedCountMAE(name="count_mae", max_bin=16),
+            ExpectedCountMAE(name="count_mae", max_bin=max_bin),
             NormalizedEarthMoversDistance1D()
         ],
     }
 
+    # 6. Compile Model
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(config.LEARNING_RATE),
+        optimizer=tf.keras.optimizers.Adam(cfg.get("LEARNING_RATE", 1e-3)),
         loss=losses,
         metrics=metrics,
     )
 
+    # 7. Setup Callbacks
+    checkpoint_dir = cfg.get("CHECKPOINT_DIR", "./checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            filepath=os.path.join(config.CHECKPOINT_DIR, "best.keras"),
+            filepath=os.path.join(checkpoint_dir, "best.keras"),
             monitor="val_loss",
             save_best_only=True,
         ),
@@ -274,6 +245,7 @@ def train(
         LossAnnealingCallback(weight_binary, weight_slice, epochs)
     ]
 
+    # 8. Train Model
     history = model.fit(
         train_ds,
         validation_data=val_ds,

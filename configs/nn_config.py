@@ -33,36 +33,28 @@ VAL_STRIDE_SEC = 1
 EQUALIZE_Q2_VAL = False
 
 # Checkpoints
-CHECKPOINT_DIR = 'checkpoints/KL_04-13'
+CHECKPOINT_DIR = 'checkpoints/KL_04-13_b'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # NN Hyperparameters
 SPATIAL_SHAPE = (16, 4, 1536)
 SLICE_HIDDEN_DIMS = (512, 256)
 TEMPORAL_DIM = 256
-NUM_TEMPORAL_LAYERS = 3
+NUM_TEMPORAL_LAYERS = 5
 KERNEL_SIZE = 3
+ACTIVATION = 'gelu'
 DROPOUT = 0.1
-L2_REG = 0.1
+L2_REG = 0.01
 USE_GATING = True
 MAX_BIN = 16
 
 # Continuous-confidence configuration
 USE_CONTINUOUS_CONFIDENCE = True
-CONFIDENCE_PARAMS = {
-    "duration_stats": {
-        "mean": 0.09197873701622324,
-        "std": 0.019943076189245984,
-    },
-    "bandwidth_stats": {
-        "mean": 1019.8970794938352,
-        "std": 246.82156166917892,
-    },
-    "logistic_params": {
-        'k': 1.0,
-        'x0': -4.0,
-        'lower': 0.0, 
-        'upper': 1.0,
-        'clip_z': 10.0
-    }
+CONFIDENCE_LOGISTIC_PARAMS = {
+    'k': 1.0,
+    'x0': -4.0,
+    'lower': 0.0, 
+    'upper': 1.0,
+    'clip_z': 10.0
 }
+

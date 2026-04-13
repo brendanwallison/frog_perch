@@ -7,8 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 
-import frog_perch.config as config
-from frog_perch.models.perch_wrapper import PerchWrapper
+from frog_perch.nn_models.perch_wrapper import PerchWrapper
 
 from frog_perch.utils.audio import load_audio, resample_array
 from frog_perch.utils.annotations import (
@@ -82,38 +81,33 @@ class FrogPerchDataset:
     """
     def __init__(
         self,
-        audio_dir=None,
-        annotation_dir=None,
-        split_type="train",
-        test_split=None,
-        val_split=None,
-        pos_ratio=None,
-        random_seed=None,
-        val_stride_sec=None,
-        use_continuous_confidence=True,
-        confidence_params=None,
+        audio_dir: str,           # Now required
+        annotation_dir: str,      # Now required
+        split_type: str = "train",
+        test_split: float = 0.15,
+        val_split: float = 0.1,
+        pos_ratio: float = 0.5,
+        random_seed: int = 41,
+        val_stride_sec: float = 1.0,
+        use_continuous_confidence: bool = True,
+        confidence_params: dict = None,
+        # Exposed Perch/Audio settings with original defaults
+        dataset_sample_rate: int = 16000,
+        clip_duration_seconds: float = 5.0,
+        perch_sample_rate: int = 32000,
+        perch_clip_seconds: float = 5.0,
     ):
-        """
-        Initialize dataset, splits, and caching layers.
-
-        Key components:
-        - deterministic split generation (leakage-safe grouping)
-        - optional precomputed metadata for training sampling
-        - validation sliding-window index for evaluation
-        - Perch embedding model for feature extraction
-        """
-
-        self.audio_dir = audio_dir or config.AUDIO_DIR
-        self.annotation_dir = annotation_dir or config.ANNOTATION_DIR
+        self.audio_dir = audio_dir
+        self.annotation_dir = annotation_dir
         self.split_type = split_type
         self.train = (split_type == "train")
 
-        self.pos_ratio = pos_ratio if pos_ratio is not None else getattr(config, "POS_RATIO", 0.5)
-        self.test_split = test_split if test_split is not None else config.TEST_SPLIT
-        self.val_split = val_split if val_split is not None else config.VAL_SPLIT
-        self.val_stride_sec = val_stride_sec or config.VAL_STRIDE_SEC
+        self.pos_ratio = pos_ratio
+        self.test_split = test_split
+        self.val_split = val_split
+        self.val_stride_sec = val_stride_sec
 
-        self.random_seed = random_seed if random_seed is not None else config.RANDOM_SEED
+        self.random_seed = random_seed
         self.use_continuous_confidence = use_continuous_confidence
 
         confidence_params = confidence_params or {}
@@ -121,12 +115,12 @@ class FrogPerchDataset:
         self.bandwidth_stats = confidence_params.get("bandwidth_stats")
         self.logistic_params = confidence_params.get("logistic_params", {})
 
-        # Audio + model configuration
-        self.sample_rate = config.DATASET_SAMPLE_RATE
-        self.clip_samples = int(config.CLIP_DURATION_SECONDS * self.sample_rate)
+        # Audio + model configuration (No longer relies on config module)
+        self.sample_rate = dataset_sample_rate
+        self.clip_samples = int(clip_duration_seconds * self.sample_rate)
 
-        self.perch_sr = config.PERCH_SAMPLE_RATE
-        self.perch_samples = config.PERCH_CLIP_SAMPLES
+        self.perch_sr = perch_sample_rate
+        self.perch_samples = int(perch_sample_rate * perch_clip_seconds)
 
         random.seed(self.random_seed)
         np.random.seed(self.random_seed)
@@ -149,9 +143,7 @@ class FrogPerchDataset:
         # Perch embedding model
         self.perch = PerchWrapper()
 
-        # Caches:
-        # - annotation cache: raw event tables per file
-        # - feature cache (if used downstream): avoids recomputation
+        # Caches
         self._annotation_cache = {}
 
     def _get_split_path(self):

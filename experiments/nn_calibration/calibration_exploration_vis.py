@@ -4,15 +4,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import binned_statistic
 import os
-import frog_perch.config as config
+import configs.nn_config as config
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import binned_statistic
-import os
-import frog_perch.config as config
 
 def plot_multiband(csv_path):
     df = pd.read_csv(csv_path)
