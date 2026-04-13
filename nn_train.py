@@ -1,5 +1,5 @@
-from frog_perch.nn_training.train import train
-import frog_perch.config as config
+from src.frog_perch.nn_training.train import train
+import configs.nn_config as config
 
 if __name__ == '__main__':
     # The updated train function now returns the model, 

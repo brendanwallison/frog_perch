@@ -4,10 +4,6 @@ import numpy as np
 import pandas as pd
 import yaml
 
-
-# ================================================================
-# File discovery + loading
-# ================================================================
 def find_raven_tables(root_dir):
     raven_files = []
     for root, _, files in os.walk(root_dir):
@@ -16,7 +12,6 @@ def find_raven_tables(root_dir):
                 raven_files.append(os.path.join(root, f))
     return raven_files
 
-
 def load_raven_table(path):
     try:
         return pd.read_csv(path, sep="\t", engine="python")
@@ -24,10 +19,6 @@ def load_raven_table(path):
         print(f"WARNING: Could not parse {path}: {e}")
         return None
 
-
-# ================================================================
-# Metric extraction
-# ================================================================
 def extract_metrics(df):
     required = ["Begin Time (s)", "End Time (s)", "Low Freq (Hz)", "High Freq (Hz)"]
     for c in required:
@@ -89,5 +80,5 @@ def main(root_dir, out_yaml="normalization.yaml"):
 
 if __name__ == "__main__":
     ANNOTATION_DIR = "/home/breallis/datasets/frog_calls/round_2"
-    OUT = "normalization.yaml"
+    OUT = "configs/normalization.yaml"
     main(ANNOTATION_DIR, OUT)
