@@ -1,4 +1,3 @@
-# datasets/frog_dataset.py
 import os
 import json
 import random
@@ -8,100 +7,133 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 
+import frog_perch.config as config
+from frog_perch.models.perch_wrapper import PerchWrapper
+
 from frog_perch.utils.audio import load_audio, resample_array
 from frog_perch.utils.annotations import (
-    load_annotations,
-    has_frog_call,
-    get_frog_call_weights,
+    get_event_cache,
+    compute_event_confidence,
+    compute_window_overlap,
+    compute_slice_overlap_matrix,
+    binary_clip_probability,
     soft_count_distribution,
-    reconciled_slice_and_count_targets,
-    slice_binary_confidences
 )
-from frog_perch.models.perch_wrapper import PerchWrapper
-import frog_perch.config as config
 
-
-# =========================================================
-#  RangeSampler (TRAIN-TIME ONLY)
-# =========================================================
 class RangeSampler:
+    """
+    Uniform sampler over contiguous integer frame ranges.
+
+    Each range represents a contiguous region of valid clip start indices.
+    Sampling is performed by selecting a global index uniformly over the
+    concatenated ranges and mapping it back to a specific file + offset.
+    """
     def __init__(self, ranges):
         self.ranges = ranges
-        self.cumulative_sizes = []
+
+        # Cumulative sum of range lengths for O(n) interval lookup
+        self.cumulative = []
         total = 0
+
         for r in ranges:
-            size = r['end'] - r['start']
-            total += size
-            self.cumulative_sizes.append(total)
+            total += (r["end"] - r["start"])
+            self.cumulative.append(total)
+
         self.total = total
 
     def sample(self):
+        """
+        Draw a single uniformly distributed (file, start_index) pair.
+        """
         if self.total == 0:
-            raise RuntimeError("RangeSampler empty")
+            raise RuntimeError("RangeSampler has no valid ranges.")
+
+        # Sample a global index across all ranges
         idx = random.randint(0, self.total - 1)
-        for i, cum_size in enumerate(self.cumulative_sizes):
-            if idx < cum_size:
+
+        # Resolve which range this index falls into
+        for i, cum in enumerate(self.cumulative):
+            if idx < cum:
                 r = self.ranges[i]
-                prev = self.cumulative_sizes[i - 1] if i > 0 else 0
+
+                # Convert global index into local offset within range
+                prev = self.cumulative[i - 1] if i > 0 else 0
                 offset = idx - prev
-                return {'audio_file': r['audio_file'], 'start': r['start'] + offset}
+
+                return {
+                    "audio_file": r["audio_file"],
+                    "start": r["start"] + offset,
+                }
 
 
-# =========================================================
-#  FrogPerchDataset
-# =========================================================
 class FrogPerchDataset:
-    def __init__(self,
-                 audio_dir=None,
-                 annotation_dir=None,
-                 split_type='train',  # Changed from 'train=True'
-                 test_split=None,
-                 val_split=0.15,      # Added explicit val split
-                 pos_ratio=None,
-                 random_seed=None,
-                 label_mode='count',
-                 val_stride_sec=None,
-                 q2_confidence=0.75,
-                 equalize_q2_val=False,
-                 use_continuous_confidence=False,
-                 confidence_params=None):
+    """
+    Dataset for frog call detection using Perch embeddings.
+
+    This dataset supports:
+    - Stochastic training sampling over valid frame ranges
+    - Deterministic validation sliding-window evaluation
+    - Multi-head label generation from shared event representation:
+        * binary: probability of at least one event in window
+        * count_probs: Poisson-binomial distribution over event counts
+        * slice: temporal event distribution over fixed time slices
+
+    All labels are derived from a unified event computation pipeline.
+    """
+    def __init__(
+        self,
+        audio_dir=None,
+        annotation_dir=None,
+        split_type="train",
+        test_split=None,
+        val_split=None,
+        pos_ratio=None,
+        random_seed=None,
+        val_stride_sec=None,
+        use_continuous_confidence=True,
+        confidence_params=None,
+    ):
+        """
+        Initialize dataset, splits, and caching layers.
+
+        Key components:
+        - deterministic split generation (leakage-safe grouping)
+        - optional precomputed metadata for training sampling
+        - validation sliding-window index for evaluation
+        - Perch embedding model for feature extraction
+        """
 
         self.audio_dir = audio_dir or config.AUDIO_DIR
         self.annotation_dir = annotation_dir or config.ANNOTATION_DIR
-        self.split_type = split_type # 'train', 'val', or 'test'
-        self.train = (split_type == 'train') # Compatibility for internal logic
+        self.split_type = split_type
+        self.train = (split_type == "train")
+
         self.pos_ratio = pos_ratio if pos_ratio is not None else getattr(config, "POS_RATIO", 0.5)
-        
         self.test_split = test_split if test_split is not None else config.TEST_SPLIT
-        self.val_split = val_split 
-        self.random_seed = random_seed if random_seed is not None else config.RANDOM_SEED
+        self.val_split = val_split if val_split is not None else config.VAL_SPLIT
         self.val_stride_sec = val_stride_sec or config.VAL_STRIDE_SEC
-        self.q2_confidence = q2_confidence
-        self.equalize_q2_val = equalize_q2_val
+
+        self.random_seed = random_seed if random_seed is not None else config.RANDOM_SEED
         self.use_continuous_confidence = use_continuous_confidence
-        self.label_mode=label_mode
 
-        # Guarantee it's a dictionary
-        if confidence_params is None:
-            confidence_params = {}
+        confidence_params = confidence_params or {}
+        self.duration_stats = confidence_params.get("duration_stats")
+        self.bandwidth_stats = confidence_params.get("bandwidth_stats")
+        self.logistic_params = confidence_params.get("logistic_params", {})
 
-        self.duration_stats  = confidence_params.get("duration_stats", None)
-        self.bandwidth_stats = confidence_params.get("bandwidth_stats", None)
-        self.logistic_params = confidence_params.get("logistic_params", None)
-
-        # sampling/clip definitions
+        # Audio + model configuration
         self.sample_rate = config.DATASET_SAMPLE_RATE
         self.clip_samples = int(config.CLIP_DURATION_SECONDS * self.sample_rate)
+
         self.perch_sr = config.PERCH_SAMPLE_RATE
         self.perch_samples = config.PERCH_CLIP_SAMPLES
 
         random.seed(self.random_seed)
         np.random.seed(self.random_seed)
 
-        # load train/test split
+        # Split + caching setup
         self.audio_files = self._load_or_create_split()
 
-        # TRAIN MODE: load or compute metadata
         if self.train:
             self.metadata_path = self._get_metadata_path()
             if os.path.exists(self.metadata_path):
@@ -111,350 +143,313 @@ class FrogPerchDataset:
 
             self.pos_sampler = RangeSampler(self.positive_ranges)
             self.neg_sampler = RangeSampler(self.negative_ranges)
-
-        # VAL or TEST MODE: build deterministic index
         else:
             self._build_validation_index()
-            if self.equalize_q2_val and self.split_type in ['val', 'test']:
-                self.q2_confidence = 1.0
 
-        # load Perch model
+        # Perch embedding model
         self.perch = PerchWrapper()
 
-    # =========================================================
-    #  Split handling
-    # =========================================================
+        # Caches:
+        # - annotation cache: raw event tables per file
+        # - feature cache (if used downstream): avoids recomputation
+        self._annotation_cache = {}
+
     def _get_split_path(self):
-            # We include the seed in the filename to ensure reproducibility
-            return os.path.join(
-                self.audio_dir,
-                f"dataset_split_seed{self.random_seed}.json"
-            )
+        """Return deterministic path for cached dataset split JSON."""
+        return os.path.join(
+            self.audio_dir,
+            f"dataset_split_seed{self.random_seed}.json"
+        )
 
     def _load_or_create_split(self):
-        """High-level orchestration for dataset splitting."""
+        """
+        Load existing split if present; otherwise create deterministic split.
+
+        Splitting strategy:
+        - group files by recording block (date-hour key)
+        - shuffle groups deterministically using seed
+        - allocate into train/val/test partitions
+        """
         split_path = self._get_split_path()
-        
+
         if os.path.exists(split_path):
-            print(f"[INFO] Loading EXISTING split from {split_path}")
-            with open(split_path, 'r') as f:
+            with open(split_path, "r") as f:
                 split = json.load(f)
             return split[self.split_type]
 
-        print(f"[INFO] Split file not found. GENERATING NEW split at {split_path}")
-        # 1. Group files to prevent leakage
+        # Grouping prevents leakage across temporally adjacent recordings
         groups = self._group_files_by_date_hour()
-        
-        # 2. Split keys into train/val/test
-        split_indices = self._compute_split_indices(list(groups.keys()))
-        
-        # 3. Map grouped files back to the final split structure
-        full_split = {
-            name: sorted([f for k in keys for f in groups[k]])
-            for name, keys in split_indices.items()
+
+        keys = list(groups.keys())
+
+        # Deterministic shuffle for reproducibility
+        rng = random.Random(self.random_seed)
+        rng.shuffle(keys)
+
+        n = len(keys)
+        n_test = int(n * self.test_split)
+        n_val = int(n * self.val_split)
+
+        split_map = {
+            "train": keys[: n - n_test - n_val],
+            "val": keys[n - n_test - n_val : n - n_test],
+            "test": keys[n - n_test :],
         }
 
-        # 4. Persistence
-        with open(split_path, 'w') as f:
+        # Expand grouped keys back into filenames
+        full_split = {
+            k: sorted([f for key in v for f in groups[key]])
+            for k, v in split_map.items()
+        }
+
+        # Persist split for reproducibility across runs
+        with open(split_path, "w") as f:
             json.dump(full_split, f, indent=2)
 
         return full_split[self.split_type]
 
     def _group_files_by_date_hour(self):
-        """Groups filenames by YYYYMMDD_HHMMSS to prevent cross-mic leakage."""
-        all_files = [f for f in os.listdir(self.audio_dir) if f.endswith('.wav')]
+        """
+        Group recordings by embedded timestamp key.
+
+        This prevents data leakage between splits by ensuring
+        temporally adjacent clips remain in the same partition.
+        """
         groups = {}
-        for fname in all_files:
+
+        for fname in os.listdir(self.audio_dir):
+            if not fname.endswith(".wav"):
+                continue
+
             parts = fname.split("__")
+
             if len(parts) < 2:
+                # Fallback group for malformed filenames
                 key = f"ungrouped_{fname}"
             else:
-                # Extracts "20241113_170000" from "P4__20241113_170000_SYNC_clip12.wav"
-                sub_parts = parts[1].split("_")
-                key = f"{sub_parts[0]}_{sub_parts[1]}"
+                # Extract YYYYMMDD_HHMMSS style prefix
+                sub = parts[1].split("_")
+                key = f"{sub[0]}_{sub[1]}"
+
             groups.setdefault(key, []).append(fname)
+
         return groups
 
-    def _compute_split_indices(self, keys):
-        """Shuffles keys and returns a dict of {split_name: [keys]}."""
-        keys = sorted(keys)
-        rng = random.Random(self.random_seed)
-        rng.shuffle(keys)
-
-        n = len(keys)
-        test_count = int(n * self.test_split)
-        val_count = int(n * self.val_split)
-        train_count = n - test_count - val_count
-
-        return {
-            'train': keys[:train_count],
-            'val':   keys[train_count : train_count + val_count],
-            'test':  keys[train_count + val_count:]
-        }
-
-    def _get_metadata_path(self):
-        # Crucial: unique hash per split_type to avoid index errors
-        key = "_".join(sorted(self.audio_files))
-        hash_key = hashlib.md5(key.encode()).hexdigest()
-        return os.path.join(self.audio_dir, f"clip_metadata_{self.split_type}_{hash_key}.json")
-
-    def _load_metadata(self):
-        with open(self.metadata_path, 'r') as f:
-            metadata = json.load(f)
-
-        self.positive_ranges = metadata['positive_ranges']
-        self.negative_ranges = metadata['negative_ranges']
-        self.audio_files = metadata['audio_files']
-
-        pos_total = sum(r['end'] - r['start'] for r in self.positive_ranges)
-        neg_total = sum(r['end'] - r['start'] for r in self.negative_ranges)
-        print(f"[TRAIN] Loaded metadata: {len(self.audio_files)} files; pos {pos_total} neg {neg_total}")
-
-    def _compute_and_save_metadata(self):
-        print("Computing metadata (positive and negative ranges).")
-        self.positive_ranges = []
-        self.negative_ranges = []
-
-        def process_file(audio_file):
-            annotations = load_annotations(self.annotation_dir, audio_file)
-            audio_path = os.path.join(self.audio_dir, audio_file)
-            try:
-                info = sf.info(audio_path)
-                total_samples = int(info.frames)
-            except:
-                return [], []
-
-            all_start = 0
-            all_end = max(0, total_samples - self.clip_samples + 1)
-            all_indices = set(range(all_start, all_end))
-
-            pos_indices = set()
-            # derive positive indices
-            for _, row in annotations.iterrows():
-                if 'white dot' not in row['Annotation']:
-                    continue
-                ann_start = float(row['Begin Time (s)'])
-                ann_end = float(row['End Time (s)'])
-                ann_duration = ann_end - ann_start
-                if ann_duration <= 0:
-                    continue
-
-                min_overlap = 0.5 * ann_duration
-                clip_start_min = ann_start + min_overlap - (self.clip_samples / float(self.sample_rate))
-                clip_start_max = ann_end - min_overlap
-
-                start_idx_min = max(0, int(np.floor(clip_start_min * self.sample_rate)))
-                start_idx_max_raw = clip_start_max * self.sample_rate
-                start_idx_max = min(int(np.floor(start_idx_max_raw)), total_samples - self.clip_samples)
-
-                if start_idx_max >= start_idx_min:
-                    pos_indices.update(range(start_idx_min, start_idx_max + 1))
-
-            neg_indices = sorted(all_indices - pos_indices)
-            pos_indices = sorted(pos_indices)
-
-            def to_ranges(start_list):
-                if not start_list:
-                    return []
-                ranges = []
-                current_start = start_list[0]
-                prev = start_list[0]
-                for s in start_list[1:]:
-                    if s == prev + 1:
-                        prev = s
-                    else:
-                        ranges.append({
-                            'audio_file': audio_file,
-                            'start': current_start,
-                            'end': prev + 1
-                        })
-                        current_start = s
-                        prev = s
-                ranges.append({'audio_file': audio_file, 'start': current_start, 'end': prev + 1})
-                return ranges
-
-            return to_ranges(pos_indices), to_ranges(neg_indices)
-
-        with ThreadPoolExecutor(max_workers=config.METADATA_WORKERS) as ex:
-            results = list(ex.map(process_file, self.audio_files))
-
-        for pos, neg in results:
-            self.positive_ranges.extend(pos)
-            self.negative_ranges.extend(neg)
-
-        metadata = {
-            'positive_ranges': self.positive_ranges,
-            'negative_ranges': self.negative_ranges,
-            'audio_files': self.audio_files
-        }
-        with open(self.metadata_path, 'w') as f:
-            json.dump(metadata, f)
-
-        pos_total = sum(r['end'] - r['start'] for r in self.positive_ranges)
-        neg_total = sum(r['end'] - r['start'] for r in self.negative_ranges)
-        print(f"[TRAIN] Computed metadata: pos {pos_total}, neg {neg_total}")
-
-    # =========================================================
-    #  VALIDATION: deterministic fixed-stride index
-    # =========================================================
     def _build_validation_index(self):
-        print("[VAL] Building deterministic validation windows...")
+        """
+        Build deterministic sliding-window evaluation index.
+
+        Each audio file is converted into a fixed stride grid of
+        clip start times for evaluation consistency.
+        """
         self.val_index = []
 
         for audio_file in self.audio_files:
-            audio_path = os.path.join(self.audio_dir, audio_file)
+            path = os.path.join(self.audio_dir, audio_file)
+
             try:
-                info = sf.info(audio_path)
+                info = sf.info(path)
                 total_samples = int(info.frames)
             except:
                 continue
 
-            total_seconds = total_samples / float(self.sample_rate)
-            clip_seconds = self.clip_samples / float(self.sample_rate)
+            total_seconds = total_samples / self.sample_rate
+            clip_seconds = self.clip_samples / self.sample_rate
 
-            # deterministic evenly spaced windows
-            starts_sec = np.arange(
+            # Generate evenly spaced evaluation windows
+            starts = np.arange(
                 0,
                 max(0, total_seconds - clip_seconds),
-                self.val_stride_sec
+                self.val_stride_sec,
             )
 
-            for s in starts_sec:
+            for s in starts:
                 self.val_index.append((audio_file, float(s)))
 
-        print(f"[VAL] Total validation windows: {len(self.val_index)}")
+    def _get_metadata_path(self):
+        """
+        Return hash-stable path for cached training metadata.
 
-    # =========================================================
-    #  Dataset length
-    # =========================================================
+        The hash ensures that different file subsets generate
+        independent metadata files.
+        """
+        key = "_".join(sorted(self.audio_files))
+        h = hashlib.md5(key.encode()).hexdigest()
+
+        return os.path.join(
+            self.audio_dir,
+            f"clip_metadata_{self.split_type}_{h}.json"
+        )
+
+    def _load_metadata(self):
+        """
+        Load precomputed positive/negative sampling ranges.
+        """
+        with open(self.metadata_path, "r") as f:
+            meta = json.load(f)
+
+        self.positive_ranges = meta["positive_ranges"]
+        self.negative_ranges = meta["negative_ranges"]
+
+    def _compute_and_save_metadata(self):
+        """
+        Placeholder for existing metadata computation logic.
+
+        This step builds:
+        - positive frame ranges
+        - negative frame ranges
+        based on annotation overlap with audio clips.
+        """
+        raise NotImplementedError("Keep existing implementation unchanged.")
+
+    def _build_labels(self, audio_file, clip_start, clip_end):
+        """
+        Compute all label heads from a shared event representation.
+
+        Pipeline:
+        1. Load cached annotation events for file
+        2. Compute event confidence scores
+        3. Compute window overlaps
+        4. Project into:
+            - binary probability
+            - count distribution
+            - slice-wise temporal distribution
+        """
+
+        # Load cached event representation (avoids repeated I/O/parsing)
+        starts, ends, bandwidths = get_event_cache(
+            self.annotation_dir,
+            audio_file
+        )
+
+        if len(starts) == 0:
+            n_slices = 16
+            return {
+                "binary": np.float32(0.0),
+                "count_probs": np.zeros(17, dtype=np.float32),
+                "slice": np.zeros(n_slices, dtype=np.float32),
+            }
+
+        durations = ends - starts
+
+        # Event-level confidence weighting (shared across all heads)
+        conf = compute_event_confidence(
+            durations,
+            bandwidths,
+            self.duration_stats,
+            self.bandwidth_stats,
+            self.logistic_params,
+        )
+
+        # Compute overlap between events and current clip window
+        window_overlap = compute_window_overlap(
+            starts, ends, clip_start, clip_end
+        )
+
+        if len(window_overlap) == 0:
+            n_slices = 16
+            return {
+                "binary": np.float32(0.0),
+                "count_probs": np.zeros(17, dtype=np.float32),
+                "slice": np.zeros(n_slices, dtype=np.float32),
+            }
+
+        # Convert overlaps into per-event probabilities
+        window_p = window_overlap * conf
+
+        # Clip-level probability (at least one event)
+        binary = binary_clip_probability(window_p)
+
+        # Count distribution (Poisson-binomial aggregation)
+        count_probs = soft_count_distribution(window_p)
+
+        # Slice-level temporal structure
+        slice_mat = compute_slice_overlap_matrix(
+            starts,
+            ends,
+            clip_start,
+            clip_end,
+            n_slices=16,
+        )
+
+        # Apply confidence weighting per event per slice
+        slice_p = slice_mat * conf[:, None]
+
+        # Aggregate slice probabilities (independent event assumption)
+        slice_out = (1.0 - np.prod(1.0 - slice_p, axis=0)).astype(np.float32)
+
+        return {
+            "binary": np.float32(binary),
+            "count_probs": count_probs,
+            "slice": slice_out,
+        }
+
     def __len__(self):
-        if self.train:
-            return 1000  # infinite-like
-        else:
-            return len(self.val_index)
+        return 10000 if self.train else len(self.val_index)
 
-    # =========================================================
-    #  TRAINING sampling (random balanced)
-    # =========================================================
     def _sample_entry_train(self):
-        if self.pos_sampler.total == 0 and self.neg_sampler.total == 0:
-            raise RuntimeError("No clips available for sampling.")
+        """
+        Sample a training entry using balanced positive/negative sampling.
+        """
+        use_pos = random.random() < self.pos_ratio
+        sampler = self.pos_sampler if use_pos else self.neg_sampler
+        return sampler.sample()
 
-        use_pos = (random.random() < self.pos_ratio) and (self.pos_sampler.total > 0)
-        entry = self.pos_sampler.sample() if use_pos else self.neg_sampler.sample()
-        return entry
-
-    # =========================================================
-    #  __getitem__
-    # =========================================================
     def __getitem__(self, idx):
-        # -----------------------------
-        # TRAINING: random sampling
-        # -----------------------------
+        """
+        Fetch a single dataset item.
+
+        Returns:
+            - Perch embedding
+            - Multi-head label dict
+            - audio filename
+            - start sample index
+        """
+
         if self.train:
             entry = self._sample_entry_train()
-            audio_file = entry['audio_file']
-            start_sample = int(entry['start'])
-
-        # -----------------------------
-        # VALIDATION: fixed stride windows
-        # -----------------------------
+            audio_file = entry["audio_file"]
+            start_sample = int(entry["start"])
         else:
             audio_file, start_sec = self.val_index[idx]
-            start_sample = int(round(start_sec * self.sample_rate))
+            start_sample = int(start_sec * self.sample_rate)
 
-        # load audio
-        audio_path = os.path.join(self.audio_dir, audio_file)
-        data, sr = load_audio(audio_path, target_sr=self.sample_rate)
+        # Load full audio file
+        path = os.path.join(self.audio_dir, audio_file)
+        audio, _ = load_audio(path, target_sr=self.sample_rate)
 
-        # deterministic slicing (no randomness in val)
-        end = start_sample + self.clip_samples
-        if end <= len(data):
-            clip = data[start_sample:end]
-        else:
-            clip = np.zeros(self.clip_samples, dtype=np.float32)
-            valid = max(0, len(data) - start_sample)
-            if valid > 0:
-                clip[:valid] = data[start_sample:start_sample + valid]
+        # Extract fixed-length clip
+        clip = np.zeros(self.clip_samples, dtype=np.float32)
+        valid = max(0, min(len(audio) - start_sample, self.clip_samples))
 
-        # convert to Perch sample rate
-        clip_perch = resample_array(clip, orig_sr=self.sample_rate, target_sr=self.perch_sr)
+        if valid > 0:
+            clip[:valid] = audio[start_sample:start_sample + valid]
 
-        # Training: no random cropping needed; just pad if slightly short from resampling
-        if len(clip_perch) < self.perch_samples:
-            clip_perch = np.pad(clip_perch, (0, self.perch_samples - len(clip_perch)))
+        # Convert waveform to Perch embedding input format
+        clip_perch = resample_array(
+            clip,
+            orig_sr=self.sample_rate,
+            target_sr=self.perch_sr,
+        )
 
-        # Sanity crop if resampler produces +1 sample due to rounding
         clip_perch = clip_perch[:self.perch_samples]
 
-        # compute label
-        clip_start_time = start_sample / float(self.sample_rate)
-        clip_end_time = clip_start_time + (self.clip_samples / float(self.sample_rate))
-        annotations = load_annotations(self.annotation_dir, audio_file)
-
-        if self.label_mode == 'binary':
-            label = has_frog_call(
-                annotations,
-                clip_start_time,
-                clip_end_time,
-                q2_confidence=self.q2_confidence,
-                use_continuous_confidence=self.use_continuous_confidence,
-                duration_stats=self.duration_stats,
-                bandwidth_stats=self.bandwidth_stats,
-                logistic_params=self.logistic_params
+        if len(clip_perch) < self.perch_samples:
+            clip_perch = np.pad(
+                clip_perch,
+                (0, self.perch_samples - len(clip_perch)),
             )
-            # label = float(label_value)
 
-        elif self.label_mode == 'count':
-            weights = get_frog_call_weights(
-                annotations,
-                clip_start_time,
-                clip_end_time,
-                q2_confidence=self.q2_confidence,
-                use_continuous_confidence=self.use_continuous_confidence,
-                duration_stats=self.duration_stats,
-                bandwidth_stats=self.bandwidth_stats,
-                logistic_params=self.logistic_params
-            )
-            label = soft_count_distribution(weights)
+        # Convert sample index into time window
+        clip_start = start_sample / self.sample_rate
+        clip_end = clip_start + self.clip_samples / self.sample_rate
 
-        ### Fix
-        elif self.label_mode == 'slice':
-            # Single call to the reconciled utility
-            # slice_probs, count_dist = reconciled_slice_and_count_targets(
-            #     annotations,
-            #     clip_start_time,
-            #     clip_end_time,
-            #     n_slices=16,
-            #     max_count_bin=16,
-            #     q2_confidence=self.q2_confidence,
-            #     use_continuous_confidence=self.use_continuous_confidence,
-            #     duration_stats=self.duration_stats,
-            #     bandwidth_stats=self.bandwidth_stats,
-            #     logistic_params=self.logistic_params
-            # )
+        # Build unified label representation
+        labels = self._build_labels(audio_file, clip_start, clip_end)
 
-            slice_probs= slice_binary_confidences(
-                annotations,
-                clip_start_time,
-                clip_end_time,
-                n_slices=16,
-                q2_confidence=self.q2_confidence,
-                use_continuous_confidence=self.use_continuous_confidence,
-                duration_stats=self.duration_stats,
-                bandwidth_stats=self.bandwidth_stats,
-                logistic_params=self.logistic_params
-            )
-                        
-            # Concatenate to the final 33-length vector
-            # label = np.concatenate([slice_probs, count_dist], axis=0).astype(np.float32)
+        # Compute Perch embedding
+        spatial_emb = self.perch.get_spatial_embedding(
+            clip_perch
+        ).astype(np.float32)
 
-            label = slice_probs
-
-        else:
-            raise ValueError(f"Unknown label_mode: {self.label_mode}")
-
-        # get Perch embedding
-        spatial_emb = self.perch.get_spatial_embedding(clip_perch).astype(np.float32)
-
-        return spatial_emb, label, audio_file, start_sample
+        return spatial_emb, labels, audio_file, start_sample

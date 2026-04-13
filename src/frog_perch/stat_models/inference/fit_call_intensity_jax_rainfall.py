@@ -38,7 +38,6 @@ def main():
     # --- Path Resolution from Config ---
     csv_dir = Path(cfg["csv_dir"])
     rain_path = Path(cfg["rain_csv"])
-    climate_path = Path(cfg["climate_csv"])
     output_dir = Path(cfg["output_dir"])
     calibration_json_path = Path(cfg["calibration_json_path"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -52,19 +51,15 @@ def main():
     
     print(f"🌧️ Loading rainfall data from {rain_path}...")
     df_rain = pd.read_csv(rain_path)
-
-    print(f"🌧️ Loading climate data from {climate_path}...")
-    df_climate = pd.read_csv(climate_path)
     
     print(f"⚙️ Loading calibration parameters from {calibration_json_path}...")
     with open(calibration_json_path, 'r') as f:
         calib_params = json.load(f)
     
     print("🛠️ Preparing Hydrological Decay data...")
-    stan_data, windows_df, params, climate_scaling = prepare_stan_data_hydrological(
+    stan_data, windows_df, params = prepare_stan_data_hydrological(
         df_raw,
         df_rain,
-        df_climate,
         calibration_params=calib_params,
         bin_duration_sec=cfg["bin_duration_sec"],
         window_length_sec=cfg["window_length_sec"],
@@ -73,7 +68,7 @@ def main():
     )
     
     # --- 2. Run Inference (JAX) ---
-    print("🔥 Starting Sampling (NumPyro - Rain Model)...")
+    print("🔥 Starting Sampling (NumPyro - Baseline Rain Model)...")
     mcmc = compile_and_run(
         stan_data,
         num_warmup=cfg["warmup"],
@@ -86,46 +81,36 @@ def main():
     print(f"💾 Saving results to {output_dir}...")
     
     # Convert to ArviZ InferenceData
-    # UPDATED: Mapping the dual-scale variables and wetness states
     idata = az.from_numpyro(
         mcmc,
         constant_data={
             "w_obs": stan_data["w_obs"],
-            "precip_daily": stan_data["precip_daily"],
-            "X_climate": stan_data["X_climate"] # NEW
+            "precip_daily": stan_data["precip_daily"]
         },
         dims={
-            "trend_diel": ["time"],
-            "lambda": ["time"],
-            "alpha_day": ["day_id"],
+            "alpha_day_raw": ["day_id"],
             "daily_wetness_fast": ["day_id"],
-            "daily_wetness_slow": ["day_id"],
-            "beta_day_climate": ["climate_var"] # NEW
+            "daily_wetness_slow": ["day_id"]
         },
         coords={
             "time": windows_df["mid_time_hour"].values,
-            "day_id": np.arange(stan_data["num_days"]),
-            "climate_var": ["temp", "relative_humidity", "light"] # NEW
+            "day_id": np.arange(stan_data["num_days"])
         }
     )
     
     idata.to_netcdf(output_dir / "inference_data_rain.nc")
-
-    # Save climate scaling for downstream un-standardization
-    with open(output_dir / "climate_scaling.json", "w") as f:
-        json.dump(climate_scaling, f, indent=4)
     
     # Save auxiliary data
     df_raw.to_csv(output_dir / "merged_detector_data.csv", index=False)
     windows_df.to_csv(output_dir / "windowed_detector_data.csv", index=False)
     
-    # UPDATED: Save B_diel for manual reconstruction in visualization
+    # Save B_diel for manual reconstruction in visualization
     np.savez(
         output_dir / "model_params.npz", 
         diel_step_min=params["diel_step_min"],
         burn_in_days=params["burn_in_days"],
         precip_daily=stan_data["precip_daily"],
-        B_diel=stan_data["B_diel"]  # NEW: Required for reconstruction
+        B_diel=stan_data["B_diel"]
     )
     
     # Print Summary 
@@ -134,7 +119,7 @@ def main():
         "beta_0", "phi", 
         "gamma_fast", "half_life_fast_val", 
         "gamma_slow", "half_life_slow_val", 
-        "sigma_diel", "sigma_day", "beta_day_climate"
+        "sigma_diel", "sigma_day"
     ]
     print(az.summary(idata, var_names=vars_to_summary))
     print("\n✅ Finished successfully.")

@@ -1,0 +1,5 @@
+old/outputs/
+stat_results/
+stan_results/
+checkpoints/
+**/__pycache__

@@ -11,7 +11,7 @@ sys.path.append(os.path.join(os.getcwd(), 'src'))
 
 import frog_perch.config as config
 from frog_perch.datasets.frog_dataset import FrogPerchDataset
-from frog_perch.training.dataset_builders import build_tf_val_dataset
+from frog_perch.nn_training.dataset_builders import build_tf_val_dataset
 
 # Import custom metrics/losses for model loading
 from frog_perch.metrics.slice_to_count_metrics import (

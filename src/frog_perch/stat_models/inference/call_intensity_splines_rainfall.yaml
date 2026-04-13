@@ -6,19 +6,20 @@ csv_dir: /home/breallis/datasets/frog_calls/gabon_full/P2_nn_features
 
 # Rainfall covariate data
 rain_csv: /home/breallis/datasets/frog_calls/gabon_rainfall_2024_full.csv
+climate_csv: /home/breallis/datasets/frog_calls/pond1_2024_Climate_data.csv
 
 # The parameters learned by the MLE calibration script
 calibration_json_path: /home/breallis/dev/frog_perch/checkpoints/pool=slice_loss=slice_x0=-3.0_k=1.0.keras_multiband_calibration_calibrated_v2.json
 
 # Output directory for the ArviZ inference data
-output_dir: stat_results/call_intensity_spline_rainfall_calibrated_v2
+output_dir: stat_results/call_intensity_spline_rainfall_climate_calibrated_v7
 
 # ---------------------------------------------------------
 # MCMC Settings
 # ---------------------------------------------------------
-warmup: 250
-sampling: 1000
-chains: 1
+warmup: 500
+sampling: 2000
+chains: 2
 seed: 20250101
 
 # ---------------------------------------------------------

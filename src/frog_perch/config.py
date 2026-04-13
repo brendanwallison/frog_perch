@@ -17,36 +17,38 @@ Q2_CONFIDENCE = 1.0
 
 # Sampling / metadata
 TEST_SPLIT = 0.15
+VAL_SPLIT = 0.1
 POS_RATIO = 0.5
 RANDOM_SEED = 41
 METADATA_WORKERS = 8  # threads for metadata creation
 
 # Training defaults
 BATCH_SIZE = 16
-EPOCHS = 10
+EPOCHS = 50
 LEARNING_RATE = 1e-4
-LABEL_MODE = 'slice'  # 'binary' or 'count'
-STEPS_PER_EPOCH = 50
+STEPS_PER_EPOCH = 100
 
 # Validation defaults
 VAL_STRIDE_SEC = 1
 EQUALIZE_Q2_VAL = False
 
 # Checkpoints
-CHECKPOINT_DIR = 'checkpoints'
+CHECKPOINT_DIR = 'checkpoints/KL_04-13'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# Downstream model pooling method
-# Options: 'mean','conv','avgmax','mlp_flat','attn','conv2','bottleneck1x1','temporal','freq'
-POOL_METHOD = 'slice'
+# NN Hyperparameters
+SPATIAL_SHAPE = (16, 4, 1536)
+SLICE_HIDDEN_DIMS = (512, 256)
+TEMPORAL_DIM = 256
+NUM_TEMPORAL_LAYERS = 3
+KERNEL_SIZE = 3
+DROPOUT = 0.1
+L2_REG = 0.1
+USE_GATING = True
+MAX_BIN = 16
 
-
-# ============================================================
 # Continuous-confidence configuration
-# ============================================================
-
 USE_CONTINUOUS_CONFIDENCE = True
-
 CONFIDENCE_PARAMS = {
     "duration_stats": {
         "mean": 0.09197873701622324,

@@ -41,26 +41,6 @@ def preprocess_viz_metadata(windows_df, precip_daily, burn_in_days, idata=None):
         "burn_in_days": burn_in_days
     }
 
-    # --- Reconstruct Daily Climate Matrix (X_day_centered) ---
-    if idata is not None and "X_climate" in idata.constant_data:
-        X_climate = idata.constant_data["X_climate"].values
-        n_days = len(full_calendar)
-        K_climate = X_climate.shape[1]
-
-        X_day_sum = np.zeros((n_days, K_climate))
-        day_counts = np.zeros(n_days)
-        
-        # Replicate JAX's segment_sum
-        np.add.at(X_day_sum, day_idx, X_climate)
-        np.add.at(day_counts, day_idx, 1.0)
-        
-        safe_counts = np.maximum(day_counts, 1.0)
-        X_day = X_day_sum / safe_counts[:, None]
-        
-        # Explicit centering to match JAX model exactly
-        X_day_centered = X_day - np.mean(X_day, axis=0)
-        viz_meta["X_day_centered"] = X_day_centered
-
     return viz_meta
 
 # ============================================================
@@ -68,7 +48,6 @@ def preprocess_viz_metadata(windows_df, precip_daily, burn_in_days, idata=None):
 # ============================================================
 
 def get_param(container, name):
-    """Handle transformed and raw param naming in Dataset or Draw dict."""
     if hasattr(container, "data_vars"):
         val = container.get(f"{name}_val", container.get(name))
     else:
@@ -97,35 +76,32 @@ def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
         "beta_0": np.zeros(n_draws),
         "rain_fast": np.zeros((n_draws, n_days)),
         "rain_slow": np.zeros((n_draws, n_days)),
-        "climate_effect": np.zeros((n_draws, n_days)), # NEW
         "alpha_day": np.zeros((n_draws, n_days)),
         "diel_peak_val": np.zeros(n_draws), 
     }
 
     print(f"⚡ Reconstructing full timeline for {n_draws} draws...")
     for i, draw in enumerate(iterate_draws(idata)):
-        # 1. Rainfall
+        # 1. Rainfall (Fast)
         wf = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_fast"))
-        ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
-        
         wf_std = wf / (np.std(wf) + 1e-6)
         decomp["rain_fast"][i] = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
         
+        # 2. Rainfall (Slow)
+        ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
         ks = get_param(draw, "k_slow")
         ns = get_param(draw, "n_slow")
         ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
         decomp["rain_slow"][i] = get_param(draw, "gamma_slow") * (ws_hill - np.mean(ws_hill))
         
-        # 2. Climate & Random Day Noise
-        beta_climate = get_param(draw, "beta_day_climate") # Shape: (3,)
-        decomp["climate_effect"][i] = viz_meta["X_day_centered"] @ beta_climate
-        
+        # 3. Daily Noise
         decomp["alpha_day"][i] = get_param(draw, "alpha_day_raw") * get_param(draw, "sigma_day")
         decomp["beta_0"][i] = get_param(draw, "beta_0")
         
-        # 3. Diel Peak
+        # 4. Diel Peak (UPDATED: Now properly mean-centered to match model geometry)
         beta_diel = np.concatenate([[0.0], np.cumsum(get_param(draw, "z_diel_raw") * get_param(draw, "sigma_diel"))])
-        decomp["diel_peak_val"][i] = np.max(B_diel @ beta_diel)
+        trend_raw = B_diel @ beta_diel
+        decomp["diel_peak_val"][i] = np.max(trend_raw - np.mean(trend_raw))
 
     return decomp
 
@@ -138,9 +114,8 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
     n_days = len(days)
     
     plt.figure(figsize=(15, 8))
-    # ADDED climate_effect in forest green
     colors = {"beta_0": "gray", "rain_fast": "blue", "rain_slow": "cyan", 
-              "climate_effect": "forestgreen", "alpha_day": "purple", "diel_peak_val": "orange"}
+              "alpha_day": "purple", "diel_peak_val": "orange"}
     
     total_log_lambda = np.zeros_like(decomp["alpha_day"])
     
@@ -156,7 +131,7 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
 
     mu_t, lo_t, hi_t = np.nanmedian(total_log_lambda, 0), np.nanpercentile(total_log_lambda, 2.5, 0), np.nanpercentile(total_log_lambda, 97.5, 0)
     plt.errorbar(days, mu_t, yerr=[mu_t-lo_t, hi_t-mu_t], fmt="o", color="black", 
-                 label="Total Influence", linewidth=0, elinewidth=1.5, alpha=0.8, zorder=10, markersize=4)
+                 label="Total Influence (Excl. Window Anomalies)", linewidth=0, elinewidth=1.5, alpha=0.8, zorder=10, markersize=4)
 
     plt.axhline(0, color='black', linestyle='--', alpha=0.3)
     plt.title("Log-Intensity Decomposition (Full Timeline)")
@@ -168,10 +143,8 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
 
 def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
     days = viz_meta["full_calendar"]
-    # Included decomp["climate_effect"]
     total_log = (decomp["beta_0"][:, None] + decomp["rain_fast"] + 
-                 decomp["rain_slow"] + decomp["climate_effect"] + 
-                 decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
+                 decomp["rain_slow"] + decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
     
     lam = np.exp(total_log)
     mu, lo, hi = np.nanmedian(lam, 0), np.nanpercentile(lam, 2.5, 0), np.nanpercentile(lam, 97.5, 0)
@@ -186,23 +159,19 @@ def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
     plt.savefig(Path(output_dir) / "seasonal_peak_intensity_log.png"); plt.close()
 
 def plot_climate_coefficients(idata, climate_scaling, output_dir):
-    """Plots the posterior distributions for the climate covariates."""
-    if "beta_day_climate" not in idata.posterior:
+    if "beta_clim_highres" not in idata.posterior:
         return
-    
-    # Extract var names from the coords saved in idata, fallback to scaling keys
+
     if "climate_var" in idata.posterior.coords:
         var_names = idata.posterior.coords["climate_var"].values
     else:
         var_names = list(climate_scaling.keys())
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    az.plot_forest(idata, var_names=["beta_day_climate"], combined=True, ax=ax)
+    az.plot_forest(idata, var_names=["beta_clim_highres"], combined=True, ax=ax)
     
-    # Overwrite y-tick labels with the actual climate variable names
-    ax.set_yticklabels(var_names[::-1]) # ArviZ plots bottom-to-top
-    
-    ax.set_title("Effect of +1 Std. Dev in Daily Climate on Log Intensity")
+    ax.set_yticklabels(var_names[::-1]) 
+    ax.set_title("Effect of Intraday Weather Anomalies on Call Rate")
     ax.axvline(0, color='red', linestyle='--', alpha=0.6)
     plt.tight_layout()
     plt.savefig(Path(output_dir) / "climate_coefficients_forest.png", dpi=150)
@@ -215,20 +184,36 @@ def plot_day_random_effects(idata, viz_meta, output_dir):
     plt.figure(figsize=(14, 5)); plt.axhline(0, color='black', ls='--')
     plt.fill_between(viz_meta["full_calendar"], lo, hi, color='slategray', alpha=0.3)
     plt.plot(viz_meta["full_calendar"], mu, color='black', linewidth=1)
-    plt.title(r"Unexplained Daily Noise ($\alpha_{day}$)") # Renamed slightly to reflect its new role
+    plt.title(r"Unexplained Daily Noise ($\alpha_{day}$)")
     plt.savefig(Path(output_dir) / "daily_random_effects.png"); plt.close()
 
 def plot_learned_diel_cycle(idata, B_diel, windows_df, output_dir):
     sigma_diel = idata.posterior.sigma_diel.values
     z_diel_raw = idata.posterior.z_diel_raw.values
     beta = np.concatenate([np.zeros((*sigma_diel.shape, 1)), np.cumsum(z_diel_raw * sigma_diel[..., np.newaxis], axis=-1)], axis=-1)
+    
+    # UPDATED: Calculate the exact mean across all observed windows to center the plot perfectly
+    full_trend = np.tensordot(beta, B_diel, axes=([-1], [1]))
+    trend_mean = np.mean(full_trend, axis=-1, keepdims=True)
+    
     u_h, u_idx = np.unique(windows_df["mid_time_hour"].values, return_index=True)
-    trend = np.tensordot(beta, B_diel[u_idx], axes=([-1], [1]))
-    flat_trend = trend.reshape(-1, len(u_h))
+    trend_raw = np.tensordot(beta, B_diel[u_idx], axes=([-1], [1]))
+    
+    # Apply the mean centering
+    trend_centered = trend_raw - trend_mean
+    flat_trend = trend_centered.reshape(-1, len(u_h))
+    
     mu, lo, hi = np.median(flat_trend, 0), np.percentile(flat_trend, 2.5, 0), np.percentile(flat_trend, 97.5, 0)
+    
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
-    ax1.plot(u_h, mu, color='firebrick'); ax1.fill_between(u_h, lo, hi, color='firebrick', alpha=0.2); ax1.set_title("Learned Diel Cycle")
-    ax2.plot(u_h, np.exp(mu), color='navy'); ax2.set_ylabel(r"Multiplicative Factor ($\exp$)")
+    ax1.plot(u_h, mu, color='firebrick')
+    ax1.fill_between(u_h, lo, hi, color='firebrick', alpha=0.2)
+    ax1.axhline(0, color='black', linestyle='--', alpha=0.5) # Added zero-line anchor
+    ax1.set_title("Learned Diel Cycle (Mean-Centered)")
+    
+    ax2.plot(u_h, np.exp(mu), color='navy')
+    ax2.axhline(1, color='black', linestyle='--', alpha=0.5) # Added 1.0 multiplier anchor
+    ax2.set_ylabel(r"Multiplicative Factor ($\exp$)")
     plt.savefig(Path(output_dir) / "learned_diel_cycle.png", dpi=150); plt.close()
 
 def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
@@ -277,11 +262,10 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
     all_t = []
     for draw in iterate_draws(idata):
         wf = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_fast"))
-        ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
-        
         wf_std = wf / (np.std(wf) + 1e-6)
         r_f = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
         
+        ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
         ks = get_param(draw, "k_slow")
         ns = get_param(draw, "n_slow")
         ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
@@ -292,14 +276,14 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
     mu, lo, hi = np.mean(all_t, 0), np.percentile(all_t, 2.5, 0), np.percentile(all_t, 97.5, 0)
     plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu)
     plt.fill_between(viz_meta["full_calendar"], lo, hi, alpha=0.2)
-    plt.title("Total Rain Influence (Full Timeline)"); plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
+    plt.title("Total Rain Influence (Baseline)"); plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_climate_calibrated_v1"),
+        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_climate_calibrated_v4"),
         help="Directory containing inference outputs (default: current directory)"
     )
     args = parser.parse_args()
@@ -319,7 +303,7 @@ def main():
     # Build Plots
     plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, args.output_dir)
     plot_additive_component_synthesis(decomp, viz_meta, args.output_dir)
-    plot_climate_coefficients(idata, climate_scaling, args.output_dir) # NEW PLOT
+    plot_climate_coefficients(idata, climate_scaling, args.output_dir) 
     plot_mcmc_health(idata, args.output_dir)
     plot_hydrological_half_life(idata, args.output_dir)
     plot_dual_rainfall_decay(idata, m_params["precip_daily"], args.output_dir)

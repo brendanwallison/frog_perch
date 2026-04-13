@@ -46,11 +46,9 @@ def preprocess_viz_metadata(windows_df, precip_daily, burn_in_days):
 
 def get_param(container, name):
     """Handle transformed and raw param naming in Dataset or Draw dict."""
-    # Check if we are dealing with an ArviZ posterior Dataset
     if hasattr(container, "data_vars"):
         val = container.get(f"{name}_val", container.get(name))
     else:
-        # Dealing with a single draw dictionary
         val = container.get(f"{name}_val", container.get(name))
     return getattr(val, "values", val)
 
@@ -68,21 +66,16 @@ def iterate_draws(idata):
             yield {k: post[k].values[c, d] for k in post.data_vars}
 
 def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
-    """
-    Vectorizes reconstruction for EVERY day in the sim timeline (110 days),
-    not just days with audio windows.
-    """
     post = idata.posterior
     n_draws = post.sizes["chain"] * post.sizes["draw"]
     n_days = len(viz_meta["full_calendar"])
     
-    # Components on the DAILY scale
     decomp = {
         "beta_0": np.zeros(n_draws),
         "rain_fast": np.zeros((n_draws, n_days)),
         "rain_slow": np.zeros((n_draws, n_days)),
         "alpha_day": np.zeros((n_draws, n_days)),
-        "diel_peak_val": np.zeros(n_draws), # The stationary peak of the diel spline
+        "diel_peak_val": np.zeros(n_draws), 
     }
 
     print(f"⚡ Reconstructing full 110-day timeline for {n_draws} draws...")
@@ -95,19 +88,14 @@ def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
         decomp["rain_fast"][i] = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
         
         ks = get_param(draw, "k_slow")
-        ns = get_param(draw, "n_slow_val")
-
+        ns = get_param(draw, "n_slow")
         ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
-
-        decomp["rain_slow"][i] = (
-            get_param(draw, "gamma_slow") *
-            (ws_hill - np.mean(ws_hill))
-        )
+        decomp["rain_slow"][i] = get_param(draw, "gamma_slow") * (ws_hill - np.mean(ws_hill))
         
         decomp["alpha_day"][i] = get_param(draw, "alpha_day_raw") * get_param(draw, "sigma_day")
         decomp["beta_0"][i] = get_param(draw, "beta_0")
         
-        # 2. Diel Component (Identify the peak value once per draw)
+        # 2. Diel Component 
         beta_diel = np.concatenate([[0.0], np.cumsum(get_param(draw, "z_diel_raw") * get_param(draw, "sigma_diel"))])
         decomp["diel_peak_val"][i] = np.max(B_diel @ beta_diel)
 
@@ -118,10 +106,6 @@ def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
 # ============================================================
 
 def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
-    """
-    Plots the 5 additive components across the full 110-day calendar.
-    Every day in September gets a value.
-    """
     days = viz_meta["full_calendar"]
     n_days = len(days)
     
@@ -133,21 +117,20 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
     
     for c, color in colors.items():
         vals = decomp[c]
-        if len(vals.shape) == 1: # Broadcast beta_0 and diel_peak
+        if len(vals.shape) == 1: 
             vals = np.tile(vals[:, None], (1, n_days))
         
         total_log_lambda += vals
         mu, lo, hi = np.nanmedian(vals, 0), np.nanpercentile(vals, 2.5, 0), np.nanpercentile(vals, 97.5, 0)
         plt.errorbar(days, mu, yerr=[mu-lo, hi-mu], fmt="o", color=color, 
-                     label=c.title(), linewidth=0, elinewidth=1, alpha=0.5, markersize=3)
+                     label=c.replace("_", " ").title(), linewidth=0, elinewidth=1, alpha=0.5, markersize=3)
 
-    # Plot Total
     mu_t, lo_t, hi_t = np.nanmedian(total_log_lambda, 0), np.nanpercentile(total_log_lambda, 2.5, 0), np.nanpercentile(total_log_lambda, 97.5, 0)
     plt.errorbar(days, mu_t, yerr=[mu_t-lo_t, hi_t-mu_t], fmt="o", color="black", 
                  label="Total Influence", linewidth=0, elinewidth=1.5, alpha=0.8, zorder=10, markersize=4)
 
     plt.axhline(0, color='black', linestyle='--', alpha=0.3)
-    plt.title("Log-Intensity Decomposition (Full Timeline)")
+    plt.title("Log-Intensity Decomposition (Baseline Model)")
     plt.ylabel("Log-scale Contribution")
     plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
     plt.xticks(rotation=45)
@@ -155,9 +138,7 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
     plt.savefig(Path(output_dir) / "additive_synthesis_plot.png", dpi=150); plt.close()
 
 def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
-    """Intensity plot across all 110 days, regardless of audio availability."""
     days = viz_meta["full_calendar"]
-    # Sum all log components: beta_0 + rf + rs + ad + diel_peak
     total_log = (decomp["beta_0"][:, None] + decomp["rain_fast"] + 
                  decomp["rain_slow"] + decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
     
@@ -167,7 +148,7 @@ def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
     plt.figure(figsize=(14, 7))
     plt.errorbar(days, mu, yerr=[mu-lo, hi-mu], fmt="o", color="darkcyan", linewidth=0, elinewidth=1.2, alpha=0.6)
     plt.yscale("log")
-    plt.title("Seasonal Intensity Trend (Full 110-Day Prediction)")
+    plt.title("Seasonal Intensity Trend (Full Prediction)")
     plt.ylabel(r"Intensity $\lambda$ (Log Scale)")
     plt.xticks(rotation=45)
     plt.grid(True, which="both", ls="-", alpha=0.2)
@@ -197,21 +178,18 @@ def plot_learned_diel_cycle(idata, B_diel, windows_df, output_dir):
     plt.savefig(Path(output_dir) / "learned_diel_cycle.png", dpi=150); plt.close()
 
 def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
-    """Plots daily-scale trajectories with saturation lines."""
     wf_l, ws_l, sat_l = [], [], []
     for d in iterate_draws(idata):
         wf = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_fast"))
         ws = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_slow"))
         ks = get_param(d, "k_slow")
-        ns = get_param(d, "n_slow_val") # CORRECTED
-
+        ns = get_param(d, "n_slow")
         sat = (ws ** ns) / (ks ** ns + ws ** ns)
         wf_l.append(wf); ws_l.append(ws); sat_l.append(sat)
     
     days = np.arange(len(precip_daily))
     fig, ax = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
-    # Fast Scale
     ax[0].bar(days, precip_daily, alpha=0.15, color='blue', label="Precip")
     axt0 = ax[0].twinx()
     arr_f = np.array(wf_l)
@@ -219,7 +197,6 @@ def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
     axt0.fill_between(days, np.percentile(arr_f, 2.5, 0), np.percentile(arr_f, 97.5, 0), color='tab:blue', alpha=0.2)
     ax[0].set_title("Fast Hydrological Scale (Linear)")
 
-    # Slow Scale
     ax[1].bar(days, precip_daily, alpha=0.15, color='blue')
     axt1 = ax[1].twinx()
     arr_s, arr_sat = np.array(ws_l), np.array(sat_l)
@@ -252,7 +229,7 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
         r_f = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
         
         ks = get_param(draw, "k_slow")
-        ns = get_param(draw, "n_slow_val")
+        ns = get_param(draw, "n_slow")
         ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
         
         r_s = get_param(draw, "gamma_slow") * (ws_hill - np.mean(ws_hill))
@@ -261,25 +238,28 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
     mu, lo, hi = np.mean(all_t, 0), np.percentile(all_t, 2.5, 0), np.percentile(all_t, 97.5, 0)
     plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu)
     plt.fill_between(viz_meta["full_calendar"], lo, hi, alpha=0.2)
-    plt.title("Total Rain Influence (Full Timeline)"); plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
+    plt.title("Total Rain Influence"); plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_calibrated_v1"),
+        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_climate_calibrated_v7"),
         help="Directory containing inference outputs (default: current directory)"
     )
     args = parser.parse_args()
 
+    # Load Data
     idata = az.from_netcdf(args.output_dir / "inference_data_rain.nc")
     windows_df = pd.read_csv(args.output_dir / "windowed_detector_data.csv")
     m_params = np.load(args.output_dir / "model_params.npz")
     
+    # Process & Align
     viz_meta = preprocess_viz_metadata(windows_df, m_params["precip_daily"], int(m_params["burn_in_days"]))
     decomp = get_all_decompositions(idata, viz_meta, m_params["B_diel"], m_params["precip_daily"])
 
+    # Build Plots
     plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, args.output_dir)
     plot_additive_component_synthesis(decomp, viz_meta, args.output_dir)
     plot_mcmc_health(idata, args.output_dir)
@@ -289,7 +269,7 @@ def main():
     plot_day_random_effects(idata, viz_meta, args.output_dir)
     plot_total_rain_influence(idata, viz_meta, m_params["precip_daily"], args.output_dir)
     
-    print("✅ Full Optimized Visualization Suite complete.")
+    print("✅ Full Baseline Visualization Suite complete.")
 
 if __name__ == "__main__":
     main()
