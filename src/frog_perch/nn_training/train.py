@@ -1,5 +1,4 @@
 import os
-import sys
 import numpy as np
 import tensorflow as tf
 
@@ -7,116 +6,16 @@ from frog_perch.datasets.frog_dataset import FrogPerchDataset
 from frog_perch.nn_models.downstream import build_downstream
 from frog_perch.nn_training.dataset_builders import build_tf_dataset, build_tf_val_dataset
 
-
-class GPUMemoryCallback(tf.keras.callbacks.Callback):
-    """Logs GPU memory usage at the end of each epoch."""
-    
-    def on_epoch_end(self, epoch: int, logs: dict = None) -> None:
-        try:
-            info = tf.config.experimental.get_memory_info('GPU:0')
-            used = info['current'] / (1024 ** 2)
-            peak = info['peak'] / (1024 ** 2)
-            sys.stdout.write(f"\r[GPU MEMORY] Epoch {epoch+1}: used={used:.0f} MB | peak={peak:.0f} MB   ")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-
-class LossAnnealingCallback(tf.keras.callbacks.Callback):
-    """Linearly decays binary and slice loss weights over the course of training."""
-    
-    def __init__(self, weight_binary: tf.Variable, weight_slice: tf.Variable, total_epochs: int):
-        super().__init__()
-        self.weight_binary = weight_binary
-        self.weight_slice = weight_slice
-        self.total_epochs = float(total_epochs)
-        
-        self.start_binary = 0.1
-        self.end_binary = 0.0
-        
-        self.start_slice = 1.0
-        self.end_slice = 0.0
-
-    def on_epoch_begin(self, epoch: int, logs: dict = None) -> None:
-        progress = epoch / self.total_epochs
-        
-        new_bin = self.start_binary - progress * (self.start_binary - self.end_binary)
-        new_slice = self.start_slice - progress * (self.start_slice - self.end_slice)
-        
-        self.weight_binary.assign(max(new_bin, self.end_binary))
-        self.weight_slice.assign(max(new_slice, self.end_slice))
-        
-        print(f"\n[ANNEAL] binary_weight: {new_bin:.4f} | slice_weight: {new_slice:.4f}")
-
-
-@tf.keras.utils.register_keras_serializable(package="frog_perch")
-class AnnealedLossWrapper(tf.keras.losses.Loss):
-    """Dynamically applies a tf.Variable weight to a base loss during graph execution."""
-    def __init__(self, base_loss, weight_var, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.base_loss = base_loss
-        self.weight_var = weight_var
-
-    def call(self, y_true, y_pred):
-        # The multiplication happens inside the traced graph, guaranteeing dynamic updates
-        return self.base_loss(y_true, y_pred) * self.weight_var
-
-
-@tf.keras.utils.register_keras_serializable(package="frog_perch")
-class NormalizedEarthMoversDistance1D(tf.keras.losses.Loss):
-    """Computes the normalized 1D EMD between ordinal distributions."""
-    
-    def __init__(self, name="emd_loss", **kwargs):
-        super().__init__(name=name, **kwargs)
-
-    def call(self, y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        
-        cdf_true = tf.cumsum(y_true, axis=-1)
-        cdf_pred = tf.cumsum(y_pred, axis=-1)
-        
-        # reduce_mean decouples gradient magnitude from max_bin sizing
-        return tf.reduce_mean(tf.abs(cdf_true - cdf_pred), axis=-1)
-
-
-@tf.keras.utils.register_keras_serializable(package="frog_perch")
-class ExpectedCountMAE(tf.keras.metrics.Metric):
-    """Computes the Mean Absolute Error between the expected counts of two distributions."""
-    
-    def __init__(self, max_bin=16, name="count_mae", **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.max_bin = max_bin
-        self.total_mae = self.add_weight(name="total_mae", initializer="zeros")
-        self.count_probs = self.add_weight(name="count_probs", initializer="zeros")
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        
-        # FIX: Use static range instead of dynamic tf.shape to survive Keras graph tracing
-        bins = tf.range(self.max_bin + 1, dtype=tf.float32)
-
-        expected_true = tf.reduce_sum(bins * y_true, axis=-1)
-        expected_pred = tf.reduce_sum(bins * y_pred, axis=-1)
-
-        mae = tf.abs(expected_true - expected_pred)
-
-        if sample_weight is not None:
-            sample_weight = tf.cast(sample_weight, tf.float32)
-            mae = tf.multiply(mae, sample_weight)
-            self.count_probs.assign_add(tf.reduce_sum(sample_weight))
-        else:
-            self.count_probs.assign_add(tf.cast(tf.shape(mae)[0], tf.float32))
-
-        self.total_mae.assign_add(tf.reduce_sum(mae))
-
-    def result(self):
-        return tf.math.divide_no_nan(self.total_mae, self.count_probs)
-
-    def reset_state(self):
-        self.total_mae.assign(0.0)
-        self.count_probs.assign(0.0)
+# Import custom metrics, losses, and callbacks
+from frog_perch.nn_training.metrics import (
+    AnnealedLossWrapper,
+    NormalizedEarthMoversDistance1D,
+    ExpectedCountMAE
+)
+from frog_perch.nn_training.callbacks import (
+    GPUMemoryCallback,
+    LossAnnealingCallback
+)
 
 
 def inspect_ds(ds_obj: FrogPerchDataset, name: str) -> None:
@@ -148,7 +47,7 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
 
     # 2. Setup Dataset arguments
     dataset_kwargs = dict(
-        audio_dir=cfg["AUDIO_DIR"],             # Required (Throws error if missing)
+        audio_dir=cfg["AUDIO_DIR"],             # Required
         annotation_dir=cfg["ANNOTATION_DIR"],   # Required
         random_seed=cfg.get("RANDOM_SEED", 42),
         confidence_params=confidence_params,
@@ -185,8 +84,8 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
     )
 
     # 5. Define dynamic weights
-    weight_binary = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="weight_binary")
-    weight_slice = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="weight_slice")
+    weight_binary = tf.Variable(0.1, trainable=False, dtype=tf.float32, name="weight_binary")
+    weight_slice = tf.Variable(0.1, trainable=False, dtype=tf.float32, name="weight_slice")
 
     # Wrap the standard losses with the dynamic variables
     losses = {
@@ -195,7 +94,7 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
             weight_binary, 
             name="annealed_binary"
         ),
-        "slice_logits": AnnealedLossWrapper(
+        "slice": AnnealedLossWrapper(
             tf.keras.losses.BinaryCrossentropy(from_logits=True), 
             weight_slice, 
             name="annealed_slice"
@@ -208,7 +107,7 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
             tf.keras.metrics.BinaryAccuracy(name="bin_acc"),
             tf.keras.metrics.AUC(name="bin_auc"),
         ],
-        "slice_logits": [
+        "slice": [
             tf.keras.metrics.BinaryAccuracy(name="slice_acc", threshold=0.0),
             tf.keras.metrics.AUC(name="slice_auc", from_logits=True), 
         ],
@@ -224,6 +123,7 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
         optimizer=tf.keras.optimizers.Adam(cfg.get("LEARNING_RATE", 1e-3)),
         loss=losses,
         metrics=metrics,
+        #run_eagerly=True
     )
 
     # 7. Setup Callbacks

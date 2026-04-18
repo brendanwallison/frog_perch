@@ -189,38 +189,59 @@ def binary_clip_probability(p: np.ndarray) -> float:
     return float(1.0 - np.prod(1.0 - p))
 
 
-def soft_count_distribution(weights: np.ndarray, max_bin: int = 16) -> np.ndarray:
+def soft_count_distribution(
+    weights: np.ndarray, 
+    max_bin: int = 16, 
+    epsilon: float = 1e-5
+) -> np.ndarray:
     """
-    Poisson-binomial distribution over event counts.
+    Poisson-binomial distribution over event counts with a numerical safety ghost.
 
-    weights are per-event probabilities.
+    Args:
+        weights: array of per-event probabilities (0.0 to 1.0).
+        max_bin: The maximum count to track. Bin max_bin acts as "max_bin or more".
+        epsilon: The "Ghost Bernoulli" probability to handle annotator uncertainty
+                 and prevent EMD loss collapse.
     """
     max_bin = int(max_bin)
-
-    if weights is None or len(weights) == 0:
-        out = np.zeros(max_bin + 1, dtype=np.float32)
-        out[0] = 1.0
-        return out
-
+    
+    # Initialize with the Ghost Bernoulli as our base distribution
+    # This ensures the output ALWAYS sums to 1.0 and Bin 1 is ALWAYS > 0
     dist = np.zeros(max_bin + 1, dtype=np.float32)
-    dist[0] = 1.0
+    dist[0] = 1.0 - epsilon
+    dist[1] = epsilon
+
+    # If no weights are provided, we just return the base "Ghost" distribution
+    if weights is None or len(weights) == 0:
+        return dist
 
     for p in np.clip(weights, 0.0, 1.0):
-        if p == 0:
+        # Optimization: skip events that have no chance of occurring
+        if p < 1e-6:
             continue
 
         new = np.zeros_like(dist)
+        
+        # Case: Event does NOT occur
         new += dist * (1.0 - p)
+        
+        # Case: Event DOES occur (shift all bins to the right)
         new[1:] += dist[:-1] * p
+        
+        # Stability: Accumulate any overflow into the last bin (16 or more)
         new[-1] += dist[-1] * p
+        
         dist = new
 
+    # Final normalization check to prevent floating point drift
     s = dist.sum()
     if s > 0:
         dist /= s
     else:
+        # Fallback if something went catastrophically wrong with NaNs
         dist[:] = 0
-        dist[0] = 1.0
+        dist[0] = 1.0 - epsilon
+        dist[1] = epsilon
 
     return dist.astype(np.float32)
 

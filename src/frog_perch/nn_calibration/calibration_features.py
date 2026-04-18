@@ -1,53 +1,67 @@
+"""
+calibration_feature_extraction.py
+
+Extracts ground truth counts and neural network predictions/moments 
+from a labeled dataset split for Bayesian calibration.
+"""
 import os
 import numpy as np
 import pandas as pd
-import frog_perch.config as config
-from frog_perch.datasets.frog_dataset import FrogPerchDataset
-from frog_perch.metrics.slice_to_count_metrics import targets_to_soft_counts
 
-# Import from the new core module
+from frog_perch.datasets.frog_dataset import FrogPerchDataset
+from frog_perch.utils.audio import load_audio
+from frog_perch.nn_models.model_utils import load_custom_model
 from frog_perch.nn_calibration.feature_extraction import (
     calculate_bandpass_features, 
-    load_custom_model, 
-    ensure_1d_probs, 
     calculate_window_moments
 )
-from frog_perch.utils.audio import load_audio
 
-def run_calibration_extraction(ckpt_name, split='test'):
-    ckpt_path = os.path.join(config.CHECKPOINT_DIR, ckpt_name)
-    print(f"Loading model: {ckpt_path}")
+def extract_calibration_features(
+    config_dict: dict, 
+    ckpt_name: str, 
+    split: str = 'test'
+) -> pd.DataFrame:
+    """
+    Processes a dataset split to extract model predictions and ground truth 
+    distributions for subsequent calibration model training.
+    """
+    ckpt_dir = config_dict.get("CHECKPOINT_DIR", "")
+    ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+    print(f"[INFO] Loading model: {ckpt_path}")
     model = load_custom_model(ckpt_path)
     
+    audio_dir = config_dict.get("AUDIO_DIR", "")
+    
     dataset_kwargs = dict(
-        audio_dir=config.AUDIO_DIR,
-        annotation_dir=config.ANNOTATION_DIR,
-        random_seed=config.RANDOM_SEED,
-        label_mode='slice',
-        q2_confidence=config.Q2_CONFIDENCE,
-        use_continuous_confidence=getattr(config, "USE_CONTINUOUS_CONFIDENCE", True),
-        confidence_params=getattr(config, "CONFIDENCE_PARAMS", {})
+        audio_dir=audio_dir,
+        annotation_dir=config_dict.get("ANNOTATION_DIR", ""),
+        random_seed=config_dict.get("RANDOM_SEED", 42),
+        use_continuous_confidence=config_dict.get("USE_CONTINUOUS_CONFIDENCE", True),
+        confidence_params=config_dict.get("CONFIDENCE_PARAMS", {})
     )
 
     ds_obj = FrogPerchDataset(
         split_type=split, 
-        val_stride_sec=getattr(config, "VAL_STRIDE_SEC", 1.0),
+        val_stride_sec=config_dict.get("VAL_STRIDE_SEC", 1.0),
         **dataset_kwargs
     )
     
-    sr = config.DATASET_SAMPLE_RATE 
+    sr = config_dict.get("DATASET_SAMPLE_RATE", 32000)
+    clip_seconds = config_dict.get("CLIP_DURATION_SECONDS", 5.0)
+    
     rows = []
     bins = np.arange(17)
 
-    print(f"Processing {len(ds_obj)} windows...")
+    print(f"[INFO] Processing {len(ds_obj)} windows from '{split}' split...")
 
     for i in range(len(ds_obj)):
-        emb, gt_slices, audio_file, start_sample = ds_obj[i]
+        # UPDATED: ds_obj now returns a dictionary of labels as the second element
+        emb, labels_dict, audio_file, start_sample = ds_obj[i]
         
-        audio_path = os.path.join(config.AUDIO_DIR, audio_file)
+        audio_path = os.path.join(audio_dir, audio_file)
         full_data, _ = load_audio(audio_path, target_sr=sr)
         
-        window_len = int(config.CLIP_DURATION_SECONDS * sr)
+        window_len = int(clip_seconds * sr)
         audio_window = full_data[start_sample : start_sample + window_len]
         if len(audio_window) < window_len:
             audio_window = np.pad(audio_window, (0, window_len - len(audio_window)))
@@ -55,13 +69,12 @@ def run_calibration_extraction(ckpt_name, split='test'):
         # --- Use Shared Core Functions ---
         band_results = calculate_bandpass_features(audio_window, sr)
         
-        logits = model.predict(emb[np.newaxis, ...], verbose=0)
-        probs_batch = ensure_1d_probs(logits)
+        # UPDATED: model.predict returns a dictionary
+        preds_dict = model.predict(emb[np.newaxis, ...], verbose=0)
+        nn_mu, nn_var = calculate_window_moments(preds_dict)
         
-        nn_mu, nn_var = calculate_window_moments(probs_batch)
-        
-        # Calibration specific logic (Ground Truth)
-        gt_dist = targets_to_soft_counts(gt_slices[np.newaxis, ...], max_bin=16).numpy().flatten()
+        # UPDATED: Pull ground truth distribution directly from the dataset labels dictionary
+        gt_dist = np.array(labels_dict["count_probs"]).flatten()
         gt_mu = np.sum(gt_dist * bins)
         gt_var = np.sum(gt_dist * (bins**2)) - (gt_mu**2)
 
@@ -77,13 +90,12 @@ def run_calibration_extraction(ckpt_name, split='test'):
         res.update(band_results)
         rows.append(res)
 
-        if i % 100 == 0: print(f"Processed {i}/{len(ds_obj)}...")
+        if i > 0 and i % 100 == 0: 
+            print(f"Processed {i}/{len(ds_obj)}...")
 
     df = pd.DataFrame(rows)
-    save_path = os.path.join(config.CHECKPOINT_DIR, f"{ckpt_name}_multiband_calibration.csv")
+    save_path = os.path.join(ckpt_dir, f"{ckpt_name}_multiband_calibration.csv")
     df.to_csv(save_path, index=False)
-    print(f"Saved to: {save_path}")
+    print(f"[INFO] Saved calibration mapping to: {save_path}")
+    
     return df
-
-if __name__ == "__main__":
-    run_calibration_extraction("pool=slice_loss=slice_x0=-3.0_k=1.0.keras")

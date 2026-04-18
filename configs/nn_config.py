@@ -13,7 +13,6 @@ PERCH_CLIP_SAMPLES = int(PERCH_SAMPLE_RATE * PERCH_CLIP_SECONDS)  # 160000
 # Dataset original audio sample rate (your files)
 DATASET_SAMPLE_RATE = 16000  # as you stated; used for computing metadata ranges
 CLIP_DURATION_SECONDS = PERCH_CLIP_SECONDS  # we use 5s windows for sampling
-Q2_CONFIDENCE = 1.0
 
 # Sampling / metadata
 TEST_SPLIT = 0.15
@@ -33,18 +32,18 @@ VAL_STRIDE_SEC = 1
 EQUALIZE_Q2_VAL = False
 
 # Checkpoints
-CHECKPOINT_DIR = 'checkpoints/KL_04-13_b'
+CHECKPOINT_DIR = 'checkpoints/KL_04-17_transformer_l2_1e-3_td_64'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # NN Hyperparameters
 SPATIAL_SHAPE = (16, 4, 1536)
 SLICE_HIDDEN_DIMS = (512, 256)
-TEMPORAL_DIM = 256
+TEMPORAL_DIM = 64
 NUM_TEMPORAL_LAYERS = 5
 KERNEL_SIZE = 3
 ACTIVATION = 'gelu'
 DROPOUT = 0.1
-L2_REG = 0.01
+L2_REG = 0.001
 USE_GATING = True
 MAX_BIN = 16
 

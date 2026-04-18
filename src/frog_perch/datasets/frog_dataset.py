@@ -296,84 +296,57 @@ class FrogPerchDataset:
 
     def _build_labels(self, audio_file, clip_start, clip_end):
         """
-        Compute all label heads from a shared event representation.
-
-        Pipeline:
-        1. Load cached annotation events for file
-        2. Compute event confidence scores
-        3. Compute window overlaps
-        4. Project into:
-            - binary probability
-            - count distribution
-            - slice-wise temporal distribution
+        Compute all label heads. 
+        The 'Ghost Bernoulli' (fn_floor) ensures all distributions are 
+        mathematically valid and prevents EMD collapse.
         """
+        # 1. Load cached events (should return empty arrays if no events exist)
+        starts, ends, bandwidths = get_event_cache(self.annotation_dir, audio_file)
+        
+        fn_floor = 1e-5 
+        n_slices = 16
 
-        # Load cached event representation (avoids repeated I/O/parsing)
-        starts, ends, bandwidths = get_event_cache(
-            self.annotation_dir,
-            audio_file
-        )
+        # 2. Compute Overlaps and Confidence
+        # If starts/ends are empty, window_overlap will be empty [].
+        window_overlap = compute_window_overlap(starts, ends, clip_start, clip_end)
+        
+        if len(window_overlap) > 0:
+            durations = ends - starts
+            conf = compute_event_confidence(
+                durations, bandwidths, self.duration_stats,
+                self.bandwidth_stats, self.logistic_params,
+            )
+            window_p = window_overlap * conf
+        else:
+            # No frogs in this window (or no frogs in the whole file)
+            window_p = np.array([], dtype=np.float32)
 
-        if len(starts) == 0:
-            n_slices = 16
-            return {
-                "binary": np.float32(0.0),
-                "count_probs": np.zeros(17, dtype=np.float32),
-                "slice": np.zeros(n_slices, dtype=np.float32),
-            }
+        # 3. Inject the "Ghost Bernoulli"
+        # This is our single source of truth for the False Negative Floor.
+        window_p_with_ghost = np.append(window_p, fn_floor)
 
-        durations = ends - starts
+        # 4. Generate Head Outputs
+        # count_probs now uses the ghost in the probability list
+        count_probs = soft_count_distribution(window_p_with_ghost, epsilon=0)
+        binary = binary_clip_probability(window_p_with_ghost)
 
-        # Event-level confidence weighting (shared across all heads)
-        conf = compute_event_confidence(
-            durations,
-            bandwidths,
-            self.duration_stats,
-            self.bandwidth_stats,
-            self.logistic_params,
-        )
-
-        # Compute overlap between events and current clip window
-        window_overlap = compute_window_overlap(
-            starts, ends, clip_start, clip_end
-        )
-
-        if len(window_overlap) == 0:
-            n_slices = 16
-            return {
-                "binary": np.float32(0.0),
-                "count_probs": np.zeros(17, dtype=np.float32),
-                "slice": np.zeros(n_slices, dtype=np.float32),
-            }
-
-        # Convert overlaps into per-event probabilities
-        window_p = window_overlap * conf
-
-        # Clip-level probability (at least one event)
-        binary = binary_clip_probability(window_p)
-
-        # Count distribution (Poisson-binomial aggregation)
-        count_probs = soft_count_distribution(window_p)
-
-        # Slice-level temporal structure
+        # 5. Slice Head
+        # If starts is empty, slice_mat is [0, 16]. prod(axis=0) becomes 1.0. Result is 0.0.
         slice_mat = compute_slice_overlap_matrix(
-            starts,
-            ends,
-            clip_start,
-            clip_end,
-            n_slices=16,
+            starts, ends, clip_start, clip_end, n_slices=n_slices
         )
-
-        # Apply confidence weighting per event per slice
-        slice_p = slice_mat * conf[:, None]
-
-        # Aggregate slice probabilities (independent event assumption)
-        slice_out = (1.0 - np.prod(1.0 - slice_p, axis=0)).astype(np.float32)
+        
+        # Handle confidence weighting safely for empty arrays
+        if len(window_overlap) > 0:
+            slice_p = slice_mat * conf[:, None]
+            slice_out = (1.0 - np.prod(1.0 - slice_p, axis=0)).astype(np.float32)
+        else:
+            slice_out = np.zeros(n_slices, dtype=np.float32)
 
         return {
             "binary": np.float32(binary),
             "count_probs": count_probs,
-            "slice": slice_out,
+            "slice": slice_out, 
         }
 
     def __len__(self):

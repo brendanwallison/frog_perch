@@ -40,59 +40,22 @@ def calculate_bandpass_features(audio_window, sr, sub_win_sec=0.1):
         
     return band_results
 
-def ensure_1d_probs(arr):
-    """Converts raw NN output to valid probabilities on [0, 1]."""
-    a = np.asarray(arr)
-    if a.ndim == 3 and a.shape[-1] == 1:
-        a = a[..., 0]
-    if a.ndim != 2:
-        raise ValueError(f"Unexpected prediction shape {a.shape}; expected [B, T] or [B, T, 1]")
-    
-    eps = 1e-6
-    if np.any(a < -eps) or np.any(a > 1.0 + eps):
-        a = 1.0 / (1.0 + np.exp(-a)) # Sigmoid
-    return np.clip(a, 0.0, 1.0)
-
-def calculate_window_moments(probs_batch):
+def calculate_window_moments(predictions_dict):
     """
-    Takes [B, T] slice probabilities and returns expected count (mu) 
-    and variance across slices (var) for each window.
+    Takes the dictionary output from the new Keras model and calculates 
+    the expected count (mu) and variance (var) directly from the count_probs.
     """
-    # Assuming the NN outputs probabilities for individual slices (e.g., T=16)
-    # The expected count is simply the sum of the slice probabilities
-    nn_mu = np.sum(probs_batch, axis=1)
+    # predictions_dict["count_probs"] shape: [B, max_bin + 1]
+    count_probs = np.asarray(predictions_dict["count_probs"])
     
-    # The variance of the sum of independent Bernoulli trials is sum(p * (1-p))
-    nn_var = np.sum(probs_batch * (1 - probs_batch), axis=1)
+    # Create an array of bins [0, 1, 2, ..., max_bin]
+    max_bin = count_probs.shape[1] - 1
+    bins = np.arange(max_bin + 1)
+    
+    # E[X] = sum(k * P(k))
+    nn_mu = np.sum(count_probs * bins, axis=1)
+    
+    # Var(X) = E[X^2] - (E[X])^2
+    nn_var = np.sum(count_probs * (bins**2), axis=1) - (nn_mu**2)
     
     return nn_mu, nn_var
-
-def load_custom_model(ckpt_path):
-    """Loads a Keras model with all custom metrics and layers defined."""
-    from frog_perch.metrics.slice_to_count_metrics import (
-        SliceLossWithSoftCountKL, SliceToCountKLDivergence, 
-        SliceExpectedCountMAE, SliceEMD, SliceExpectedRecall, 
-        SliceExpectedPrecision, SliceExpectedBinaryAccuracy,
-        SliceToCountWrapper
-    )
-    from frog_perch.metrics.count_metrics import (
-        ExpectedRecall, ExpectedPrecision, ExpectedBinaryAccuracy, 
-        EMD, ExpectedCountMAE
-    )
-
-    custom_objects = {
-        "SliceToCountWrapper": SliceToCountWrapper,
-        "SliceLossWithSoftCountKL": SliceLossWithSoftCountKL,
-        "SliceToCountKLDivergence": SliceToCountKLDivergence,
-        "SliceExpectedCountMAE": SliceExpectedCountMAE,
-        "SliceEMD": SliceEMD,
-        "SliceExpectedRecall": SliceExpectedRecall,
-        "SliceExpectedPrecision": SliceExpectedPrecision,
-        "SliceExpectedBinaryAccuracy": SliceExpectedBinaryAccuracy,
-        "ExpectedCountMAE": ExpectedCountMAE,
-        "EMD": EMD,
-        "ExpectedRecall": ExpectedRecall,
-        "ExpectedPrecision": ExpectedPrecision,
-        "ExpectedBinaryAccuracy": ExpectedBinaryAccuracy,
-    }
-    return tf.keras.models.load_model(ckpt_path, custom_objects=custom_objects)
