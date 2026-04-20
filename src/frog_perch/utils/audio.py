@@ -3,18 +3,75 @@ import numpy as np
 import soundfile as sf
 import librosa
 
-def load_audio(path, target_sr=None, mono=True):
+def load_audio(
+    path,
+    target_sr=None,
+    mono=True,
+    start_sample=None,
+    num_samples=None,
+):
     """
-    Load audio file with soundfile, return numpy float32 1-D array and samplerate.
-    If target_sr is provided and differs from file sr, resample with librosa.
+    Efficient audio loader.
+
+    Supports:
+    - full file load (default)
+    - partial streaming read (start_sample + num_samples)
+    - optional resampling
     """
-    data, sr = sf.read(path, always_2d=False)
-    if data.ndim > 1 and mono:
+
+    # ---------------------------
+    # Open file (streaming)
+    # ---------------------------
+    with sf.SoundFile(path) as f:
+        sr = f.samplerate
+
+        # ---------------------------
+        # Partial read (FAST PATH)
+        # ---------------------------
+        if start_sample is not None or num_samples is not None:
+            # Project requested samples into native sample rate space
+            if target_sr is not None and sr != target_sr:
+                ratio = sr / target_sr
+                native_start = int((start_sample or 0) * ratio)
+                native_num = int(num_samples * ratio) if num_samples else None
+            else:
+                native_start = start_sample or 0
+                native_num = num_samples
+
+            f.seek(native_start)
+            data = f.read(native_num, dtype="float32", always_2d=False)
+
+        # ---------------------------
+        # Full read (fallback)
+        # ---------------------------
+        else:
+            data = f.read(dtype="float32", always_2d=False)
+
+    # ---------------------------
+    # Convert to mono if needed
+    # ---------------------------
+    if mono and data.ndim > 1:
         data = np.mean(data, axis=1)
-    data = data.astype(np.float32)
+
+    # ---------------------------
+    # Resampling (only if needed)
+    # ---------------------------
     if target_sr is not None and sr != target_sr:
-        data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
+        data = librosa.resample(
+            data,
+            orig_sr=sr,
+            target_sr=target_sr
+        )
         sr = target_sr
+
+    # ---------------------------
+    # Enforce strict bounds
+    # ---------------------------
+    # Resampling can sometimes cause +/- 1 sample rounding differences.
+    # We guarantee the exact length requested.
+    if num_samples is not None and len(data) > num_samples:
+        data = data[:num_samples]
+
     return data, sr
 
 def resample_array(arr, orig_sr, target_sr):

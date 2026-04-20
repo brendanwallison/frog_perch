@@ -109,3 +109,17 @@ class ExpectedCountMAE(tf.keras.metrics.Metric):
     def reset_state(self):
         self.total_mae.assign(0.0)
         self.count_probs.assign(0.0)
+
+@tf.keras.utils.register_keras_serializable(package="frog_perch")
+class SoftBinaryAccuracy(tf.keras.metrics.BinaryAccuracy):
+    """Thresholds soft ground truths to hard binaries for accuracy evaluation."""
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_hard = tf.cast(y_true > 0.5, y_true.dtype)
+        super().update_state(y_true_hard, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="frog_perch")
+class SoftAUC(tf.keras.metrics.AUC):
+    """Thresholds soft ground truths to hard binaries for AUC histogram binning."""
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_hard = tf.cast(y_true > 0.5, y_true.dtype)
+        super().update_state(y_true_hard, y_pred, sample_weight)

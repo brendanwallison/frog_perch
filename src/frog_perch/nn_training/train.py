@@ -10,7 +10,9 @@ from frog_perch.nn_training.dataset_builders import build_tf_dataset, build_tf_v
 from frog_perch.nn_training.metrics import (
     AnnealedLossWrapper,
     NormalizedEarthMoversDistance1D,
-    ExpectedCountMAE
+    ExpectedCountMAE,
+    SoftBinaryAccuracy, 
+    SoftAUC
 )
 from frog_perch.nn_training.callbacks import (
     GPUMemoryCallback,
@@ -56,7 +58,7 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
     # 3. Build Datasets
     train_ds_obj = FrogPerchDataset(
         split_type='train', 
-        pos_ratio=cfg.get("POS_RATIO", 0.5), 
+        sampling_alpha=cfg.get("SAMPLING_ALPHA", 0.5), 
         **dataset_kwargs
     )
     val_ds_obj   = FrogPerchDataset(split_type='val', val_stride_sec=val_stride, **dataset_kwargs)
@@ -104,12 +106,12 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
 
     metrics = {
         "binary": [
-            tf.keras.metrics.BinaryAccuracy(name="bin_acc"),
-            tf.keras.metrics.AUC(name="bin_auc"),
+            SoftBinaryAccuracy(name="bin_acc"),
+            SoftAUC(name="bin_auc"),
         ],
         "slice": [
-            tf.keras.metrics.BinaryAccuracy(name="slice_acc", threshold=0.0),
-            tf.keras.metrics.AUC(name="slice_auc", from_logits=True), 
+            SoftBinaryAccuracy(name="slice_acc", threshold=0.0),
+            SoftAUC(name="slice_auc", from_logits=True), 
         ],
         "count_probs": [
             tf.keras.losses.KLDivergence(),
