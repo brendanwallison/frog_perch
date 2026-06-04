@@ -101,7 +101,8 @@ def train(cfg: dict) -> tuple[tf.keras.Model, tf.data.Dataset]:
             weight_slice, 
             name="annealed_slice"
         ),
-        "count_probs": tf.keras.losses.KLDivergence(),
+        # "count_probs": tf.keras.losses.KLDivergence(),
+        "count_probs": NormalizedEarthMoversDistance1D(),
     }
 
     metrics = {

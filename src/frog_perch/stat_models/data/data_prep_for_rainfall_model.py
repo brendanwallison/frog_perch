@@ -146,6 +146,8 @@ def prepare_stan_data_hydrological(
         hard_bounds=(17.0, 23.0)
     )
 
+    w_fraction = 1.0 / 36.0
+
     stan_data = {
         "T": len(w_obs),
         "N": int(k_max),
@@ -154,7 +156,8 @@ def prepare_stan_data_hydrological(
         "B_diel": B_diel,
         "precip_daily": precip_series.values,
         "day_idx": day_idx,
-        "num_days": len(full_date_range)
+        "num_days": len(full_date_range),
+        "w_fraction": float(w_fraction)
     }
 
     spline_params = {"diel_step_min": knot_spacing_diel_min, "burn_in_days": burn_in_days}

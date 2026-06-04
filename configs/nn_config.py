@@ -17,7 +17,7 @@ CLIP_DURATION_SECONDS = PERCH_CLIP_SECONDS  # we use 5s windows for sampling
 # Sampling / metadata
 TEST_SPLIT = 0.15
 VAL_SPLIT = 0.35
-SAMPLING_ALPHA = 0.5
+SAMPLING_ALPHA = 0.7
 RANDOM_SEED = 41
 METADATA_WORKERS = 8  # threads for metadata creation
 
@@ -32,14 +32,14 @@ VAL_STRIDE_SEC = 1
 EQUALIZE_Q2_VAL = False
 
 # Checkpoints
-CHECKPOINT_DIR = 'checkpoints/KL_04-17_conv_l2_1e-3_td_64_hd_512_128_lr_1e-5_newsampler'
+CHECKPOINT_DIR = 'checkpoints/EMD_04-17_conv_l2_1e-3_td_64_hd_512_128_nt_3_lr_1e-5_alpha_7'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # NN Hyperparameters
 SPATIAL_SHAPE = (16, 4, 1536)
 SLICE_HIDDEN_DIMS = (512, 128)
 TEMPORAL_DIM = 64
-NUM_TEMPORAL_LAYERS = 16
+NUM_TEMPORAL_LAYERS = 3
 KERNEL_SIZE = 3
 ACTIVATION = 'gelu'
 DROPOUT = 0.1

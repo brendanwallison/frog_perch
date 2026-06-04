@@ -13,6 +13,7 @@ def model(data_dict):
     N             = data_dict["N"]
     day_idx       = data_dict["day_idx"]
     num_days      = data_dict["num_days"]
+    w_fraction    = data_dict.get("w_fraction", 0.083)
     
     T, _ = w_obs.shape
     _, K_diel = B_diel.shape
@@ -96,7 +97,8 @@ def model(data_dict):
     log_det = jnp.log(w_obs + 1e-15)
     log_mix = log_bio + log_det
     log_lik_per_window = jax.scipy.special.logsumexp(log_mix, axis=1)
-    numpyro.factor("obs_log_prob", log_lik_per_window.sum())
+    scaled_log_prob = log_lik_per_window.sum() * w_fraction
+    numpyro.factor("obs_log_prob", scaled_log_prob)
 
 
 def compile_and_run(stan_data, num_warmup=1000, num_samples=1000, num_chains=4, seed=0):
