@@ -27,7 +27,7 @@ We enforce a strict separation between reusable source code and experimental con
 * Static Config (configs/nn_config.py): Controls network dimensions, regularization, paths, and training variables.
 * Dynamic Stats (configs/normalization.yaml): Contains auto-generated statistics (mean/std for confidence weighting). These are dynamically loaded at runtime.
 
-## Workflow
+## Workflow (Incomplete)
 
 1. Data Normalization: Run the dataset normalization preprocessing script to compute the mean and standard deviation of call bandwidths and durations. This outputs configs/normalization.yaml.
 2. Configure: Open configs/nn_config.py to define your paths, network size, and training dynamics.
