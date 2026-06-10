@@ -3,3 +3,4 @@ stat_results/
 stan_results/
 checkpoints/
 **/__pycache__
+val_debug/

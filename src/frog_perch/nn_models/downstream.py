@@ -1,6 +1,29 @@
 import tensorflow as tf
+import keras
 from tensorflow.keras import layers, Model, regularizers
 
+
+@keras.saving.register_keras_serializable(package="FrogPerch")
+class DropFrequencyRows(layers.Layer):
+    """
+    Slices the frequency axis (index 1) to keep only rows 1 and 2.
+    Replaces the inline lambda: lambda t: t[:, :, 1:3, :]
+    """
+    def call(self, inputs):
+        return inputs[:, :, 1:3, :]
+
+
+@keras.saving.register_keras_serializable(package="FrogPerch")
+class BinaryFromCountProbs(layers.Layer):
+    """
+    Computes presence probability (1.0 - P(count=0)).
+    Replaces the inline lambda: lambda cp: 1.0 - cp[:, 0]
+    """
+    def call(self, count_probs):
+        return 1.0 - count_probs[:, 0]
+
+
+@keras.saving.register_keras_serializable(package="FrogPerch")
 class SoftCountFromSlices(layers.Layer):
     """
     Poisson-binomial distribution over slice Bernoulli probabilities.
@@ -30,17 +53,20 @@ class SoftCountFromSlices(layers.Layer):
             p_t = tf.expand_dims(p_t, 1)
 
             shifted = tf.concat(
-                [tf.zeros((B, 1), tf.float32), dp[:, :-1]],
+                [
+                    tf.zeros((B, 1), tf.float32),
+                    dp[:, :-1],
+                ],
                 axis=1,
             )
 
             dp_new = dp * (1.0 - p_t) + shifted * p_t
 
-            # overflow accumulation (stable)
+            # Accumulate mass that would shift beyond max_bin
             dp_new = tf.concat(
                 [
                     dp_new[:, :-1],
-                    dp_new[:, -1:] + dp[:, -1:],
+                    dp_new[:, -1:] + (dp[:, -1:] * p_t),
                 ],
                 axis=1,
             )
@@ -50,193 +76,165 @@ class SoftCountFromSlices(layers.Layer):
         dp_final = tf.scan(step, probs_TB, initializer=dp0)
         return dp_final[-1]
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({"max_bin": self.max_bin})
+        return config
 
-# def build_downstream(
-#     spatial_shape=(16, 4, 1536),
-#     slice_hidden_dims=(1024, 512),  
-#     temporal_dim=128,
-#     num_temporal_layers=2,
-#     num_heads=8,                 # 128 / 8 = 16 dimensions per head
-#     activation="gelu",
-#     dropout=0.1,
-#     l2_reg=1e-4,                   
-#     max_bin=16,
-#     **kwargs                     # Captures unused kernel_size/use_gating
-# ):
-#     """
-#     Transformer-based mixing for global window context.
-#     Outputs:
-#         - slice: [B, T] (logits)
-#         - slice_probs: [B, T] (sigmoid)
-#         - count_probs: [B, max_bin+1] (PMF)
-#         - binary: [B, 1] (presence prob)
-#     """
 
-#     T, F, C = spatial_shape
-#     FLAT_DIM = F * C
+@keras.saving.register_keras_serializable(package="FrogPerch")
+class LocalExpansion(layers.Layer):
+    """
+    Learned temporal upsampling by local reshape.
 
-#     inp = layers.Input(shape=spatial_shape, dtype=tf.float32, name="spatial_emb")
+    Splits each input timestep into `factor` sub-slices using only
+    the channels allocated to that timestep — no cross-boundary
+    interpolation.
 
-#     # 1. Per-slice encoding (Identical to your Conv version)
-#     x = layers.Reshape((T, FLAT_DIM))(inp)
+    Input:  [B, T, factor * d]
+    Output: [B, T * factor, d]
 
-#     for dim in slice_hidden_dims:
-#         x = layers.TimeDistributed(
-#             layers.Dense(
-#                 dim, 
-#                 activation=activation,
-#                 kernel_regularizer=regularizers.l2(l2_reg)
-#             )
-#         )(x)
-#         x = layers.LayerNormalization()(x)
-#         x = layers.SpatialDropout1D(dropout / 2.0)(x)
+    The trunk must produce temporal_dim = factor * d channels so that
+    each timestep carries exactly enough information for its sub-slices.
+    """
 
-#     x = layers.TimeDistributed(
-#         layers.Dense(
-#             temporal_dim, 
-#             activation=activation,
-#             kernel_regularizer=regularizers.l2(l2_reg)
-#         )
-#     )(x)
-#     x = layers.LayerNormalization()(x)
+    def __init__(self, factor, **kwargs):
+        super().__init__(**kwargs)
+        self.factor = int(factor)
 
-#     # ------------------------------------------------------------
-#     # 2. Positional Encoding
-#     # ------------------------------------------------------------
-#     # Since Transformers are permutation-invariant, we must inject 
-#     # the temporal order of the 16 slices.
-#     positions = tf.range(start=0, limit=T, delta=1)
-#     pos_emb = layers.Embedding(input_dim=T, output_dim=temporal_dim)(positions)
-#     x = x + pos_emb 
+    def call(self, x):
+        B  = tf.shape(x)[0]
+        T  = tf.shape(x)[1]
+        C  = tf.shape(x)[2]
+        d  = C // self.factor
 
-#     # ------------------------------------------------------------
-#     # 3. Transformer Mixing (Residual Global Attention)
-#     # ------------------------------------------------------------
-#     for _ in range(num_temporal_layers):
-        
-#         # A. Multi-Head Self-Attention (Global context)
-#         res_inp = layers.LayerNormalization()(x)
-#         attn_out = layers.MultiHeadAttention(
-#             num_heads=num_heads, 
-#             key_dim=temporal_dim // num_heads,
-#             kernel_regularizer=regularizers.l2(l2_reg)
-#         )(res_inp, res_inp)  # Query=res_inp, Value=res_inp
-        
-#         attn_out = layers.Dropout(dropout)(attn_out)
-#         x = layers.Add()([x, attn_out]) # First Residual
+        # [B, T, factor*d] -> [B, T, factor, d]
+        x = tf.reshape(x, (B, T, self.factor, d))
 
-#         # B. Feed-Forward (No expansion, just feature refinement)
-#         res_inp = layers.LayerNormalization()(x)
-#         ffn_out = layers.Dense(
-#             temporal_dim, 
-#             activation=activation,
-#             kernel_regularizer=regularizers.l2(l2_reg)
-#         )(res_inp)
-        
-#         ffn_out = layers.Dropout(dropout)(ffn_out)
-#         x = layers.Add()([x, ffn_out]) # Second Residual
+        # [B, T, factor, d] -> [B, T*factor, d]
+        x = tf.reshape(x, (B, T * self.factor, d))
 
-#     # ------------------------------------------------------------
-#     # 4. Output Heads (Linked via TimeDistributed)
-#     # ------------------------------------------------------------
-#     x = layers.LayerNormalization()(x)
+        return x
 
-#     # Link to Slice Predictions: 
-#     # Each of the 16 refined temporal vectors (shape 128) is projected to a single logit.
-#     slice_logits = layers.TimeDistributed(
-#         layers.Dense(
-#             1, 
-#             kernel_regularizer=regularizers.l2(l2_reg)
-#         ),
-#         name="slice_dense" 
-#     )(x)
-    
-#     slice_output = layers.Reshape((T,), name="slice")(slice_logits)
-#     slice_probs = layers.Activation("sigmoid", name="slice_probs")(slice_output)
+    def get_config(self):
+        config = super().get_config()
+        config.update({"factor": self.factor})
+        return config
 
-#     # Count & Binary heads remain identical
-#     count_probs = SoftCountFromSlices(max_bin=max_bin, name="count_probs")(slice_probs)
-#     prob_zero = count_probs[:, 0:1]
-#     binary_prob = 1.0 - prob_zero 
-
-#     return Model(
-#         inputs=inp,
-#         outputs={
-#             "slice": slice_output,
-#             "slice_probs": slice_probs,
-#             "count_probs": count_probs,
-#             "binary": binary_prob,
-#         },
-#         name="frog_perch_transformer",
-#     )
 
 def build_downstream(
     spatial_shape=(16, 4, 1536),
-    slice_hidden_dims=(1024, 512),  
-    temporal_dim=128,
+    slice_hidden_dims=(1024, 512),
+    temporal_dim=384,           # must be divisible by (n_slices // T_in)
     num_temporal_layers=2,
     kernel_size=3,
     activation="gelu",
     dropout=0.1,
-    l2_reg=1e-4,                   
+    l2_reg=1e-4,
     use_gating=False,
-    max_bin=16,
+    max_bin=8,
+    n_slices=48,                # must be an integer multiple of T_in
+    drop_freq_rows=True,
 ):
     """
     Outputs:
-        - slice_logits  [B, T]
-        - slice_probs   [B, T]
+        - slice         [B, n_slices]
+        - slice_probs   [B, n_slices]
         - count_probs   [B, max_bin+1]
-        - binary_prob   [B, 1]
+        - binary        [B]
+        - count_logits  [B, n_slices]  passthrough for visualizer
     """
 
-    T, F, C = spatial_shape
-    FLAT_DIM = F * C
+    T_in, F, C = spatial_shape
 
-    inp = layers.Input(shape=spatial_shape, dtype=tf.float32, name="spatial_emb")
+    # 1. Handle Frequency Slicing
+    if drop_freq_rows:
+        assert F == 4, "drop_freq_rows requires frequency dimension to be 4"
+        # Slice frequency axis (index 1), keep rows 1 and 2 (the middle ones)
+        # Input shape becomes (16, 2, 1536)
+        spatial_shape_eff = (T_in, 2, C)
+        F_eff = 2
+    else:
+        spatial_shape_eff = spatial_shape
+        F_eff = F
 
-    # ------------------------------------------------------------
-    # Per-slice encoding (with Intermediate Normalization & L2)
-    # ------------------------------------------------------------
-    x = layers.Reshape((T, FLAT_DIM))(inp)
+    FLAT_DIM = F_eff * C
+
+    # ------------------------------------------------------------------
+    # Expansion constraints
+    # ------------------------------------------------------------------
+    assert n_slices % T_in == 0, (
+        f"n_slices ({n_slices}) must be an integer multiple of T_in ({T_in})"
+    )
+    factor = n_slices // T_in
+    assert temporal_dim % factor == 0, (
+        f"temporal_dim ({temporal_dim}) must be divisible by factor ({factor}); "
+        f"got temporal_dim={temporal_dim}, factor={factor}"
+    )
+    sub_dim = temporal_dim // factor   # channel dim after expansion
+
+    inp = layers.Input(
+        shape=spatial_shape,
+        dtype=tf.float32,
+        name="spatial_emb",
+    )
+
+    # Apply the slice toggle
+    if drop_freq_rows:
+        # Keep middle 2 rows of the frequency dimension (index 1)
+        x = DropFrequencyRows(name="drop_freq_rows")(inp)
+    else:
+        x = inp
+
+    # ------------------------------------------------------------------
+    # 1. Per-slice encoding
+    # ------------------------------------------------------------------
+
+    x = layers.Reshape((T_in, FLAT_DIM))(x)
 
     for dim in slice_hidden_dims:
         x = layers.TimeDistributed(
             layers.Dense(
-                dim, 
+                dim,
                 activation=activation,
-                kernel_regularizer=regularizers.l2(l2_reg)
+                kernel_regularizer=regularizers.l2(l2_reg),
             )
         )(x)
+
         x = layers.LayerNormalization()(x)
-        x = layers.SpatialDropout1D(dropout / 2.0)(x) # Light dropout between dense layers
+        x = layers.SpatialDropout1D(dropout / 2.0)(x)
 
     x = layers.TimeDistributed(
         layers.Dense(
-            temporal_dim, 
-            activation=activation,      # UPDATED
-            kernel_regularizer=regularizers.l2(l2_reg)
+            temporal_dim,
+            activation=activation,
+            kernel_regularizer=regularizers.l2(l2_reg),
         )
     )(x)
 
     x = layers.LayerNormalization()(x)
     x = layers.SpatialDropout1D(dropout)(x)
 
-    # ------------------------------------------------------------
-    # Temporal mixing (with Pre-Norm & L2)
-    # ------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 2. LOCAL TEMPORAL MIXING AT NATIVE RESOLUTION
+    #
+    # Keep receptive field intentionally small.
+    # This stage extracts local temporal structure from the pretrained
+    # embeddings before any expansion occurs.
+    # ------------------------------------------------------------------
+
     for _ in range(num_temporal_layers):
-        
-        # Pre-Norm: Normalize the input to the residual branch
-        res_inp = layers.LayerNormalization()(x)
-        
+        residual = x
+
+        norm = layers.LayerNormalization()(x)
+
         h = layers.Conv1D(
             filters=temporal_dim,
             kernel_size=kernel_size,
             padding="same",
             activation=activation,
-            kernel_regularizer=regularizers.l2(l2_reg)
-        )(res_inp)
+            kernel_regularizer=regularizers.l2(l2_reg),
+        )(norm)
 
         h = layers.Dropout(dropout)(h)
 
@@ -245,50 +243,109 @@ def build_downstream(
                 filters=temporal_dim,
                 kernel_size=kernel_size,
                 padding="same",
-                activation="sigmoid",   # sigmoid for gating logic [0, 1]
-                kernel_regularizer=regularizers.l2(l2_reg)
-            )(res_inp)
-            x = layers.Add()([x, layers.Multiply()([gate, h])])
-        else:
-            x = layers.Add()([x, h])
+                activation="sigmoid",
+                kernel_regularizer=regularizers.l2(l2_reg),
+            )(norm)
 
-    # ------------------------------------------------------------
-    # Output Heads
-    # ------------------------------------------------------------
+            h = layers.Multiply()([gate, h])
+
+        x = layers.Add()([residual, h])
+
+    # ------------------------------------------------------------------
+    # 3. LEARNED LOCAL EXPANSION
+    #
+    # Each input timestep is split into `factor` sub-slices purely from
+    # its own channels — no cross-boundary interpolation.
+    # [B, T_in, temporal_dim] -> [B, n_slices, sub_dim]
+    # ------------------------------------------------------------------
+
+    x = LocalExpansion(factor=factor, name="local_expansion")(x)
+
+    # Project back up to temporal_dim so refinement convolutions have
+    # full capacity.
+    x = layers.Dense(
+        temporal_dim,
+        activation=activation,
+        kernel_regularizer=regularizers.l2(l2_reg),
+        name="expansion_proj",
+    )(x)
+
     x = layers.LayerNormalization()(x)
 
-    # 1. Slice Head (Named "slice" to match dataset labels)
-    # We produce raw logits here for numerical stability in the loss function,
-    # but the head is named semantically.
+    # ------------------------------------------------------------------
+    # 4. SHALLOW LOCAL REFINEMENT AT TARGET RESOLUTION
+    #
+    # Allows limited information sharing across sub-slice boundaries
+    # via small receptive field convolutions.
+    # ------------------------------------------------------------------
+
+    for _ in range(3):
+        residual = x
+
+        h = layers.LayerNormalization()(x)
+
+        h = layers.Conv1D(
+            filters=temporal_dim,
+            kernel_size=3,
+            padding="same",
+            activation=activation,
+            kernel_regularizer=regularizers.l2(l2_reg),
+        )(h)
+
+        h = layers.Dropout(dropout / 2.0)(h)
+
+        x = layers.Add()([residual, h])
+
+    x = layers.LayerNormalization()(x)
+
+    # ------------------------------------------------------------------
+    # A. COUNTING BRANCH
+    # ------------------------------------------------------------------
+
+    count_logits = layers.TimeDistributed(
+        layers.Dense(
+            1,
+            kernel_regularizer=regularizers.l2(l2_reg),
+        ),
+        name="count_dense",
+    )(x)
+
+    count_logits = layers.Flatten()(count_logits)
+
+    count_probs_t = layers.Activation(
+        "sigmoid",
+        name="count_slice_probs",
+    )(count_logits)
+
+    count_probs = SoftCountFromSlices(
+        max_bin=max_bin,
+        name="count_probs",
+    )(count_probs_t)
+
+    binary_prob = BinaryFromCountProbs(
+        name="binary",
+    )(count_probs)
+
+    # ------------------------------------------------------------------
+    # B. SLICE CLASSIFICATION BRANCH
+    # ------------------------------------------------------------------
+
     slice_logits = layers.TimeDistributed(
         layers.Dense(
-            1, 
-            kernel_regularizer=regularizers.l2(l2_reg)
+            1,
+            kernel_regularizer=regularizers.l2(l2_reg),
         ),
-        name="slice_dense" 
+        name="slice_dense",
     )(x)
-    
-    # Final slice output: [B, T]
-    slice_output = layers.Reshape((T,), name="slice")(slice_logits)
 
-    # 2. Probability Conversion (Internal)
-    # Needed for the Poisson-Binomial layer, even if not used as a primary loss target.
-    slice_probs = layers.Activation("sigmoid", name="slice_probs")(slice_output)
-
-    # 3. Count Head: Poisson-Binomial Distribution [B, max_bin + 1]
-    count_probs = SoftCountFromSlices(max_bin=max_bin, name="count_probs")(slice_probs)
-    
-    # 4. Binary Head: Probability of at least one call [B]
-    prob_zero = count_probs[:, 0] # Removed the 0:1 slice to drop the extra dimension
-    binary_prob = 1.0 - prob_zero
+    slice_output = layers.Flatten(name="slice")(slice_logits)
 
     return Model(
         inputs=inp,
         outputs={
-            "slice": slice_output,        # Binary targets (0/1) go here
-            "slice_probs": slice_probs,   # For visualization/inference
-            "count_probs": count_probs,   # PMF targets go here
-            "binary": binary_prob,        # Presence/Absence targets go here
+            "slice":        slice_output,
+            "count_probs":  count_probs,
+            "binary":       binary_prob,
         },
-        name="frog_perch_downstream",
+        name="frog_perch_local_interpolation",
     )

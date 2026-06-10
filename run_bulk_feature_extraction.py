@@ -12,15 +12,14 @@ import argparse
 import configs.nn_config as config
 
 # Import our refactored module
-from src.frog_perch.nn_calibration.feature_extraction_pipeline import process_directory
+from frog_perch.nn_calibration.feature_extraction_pipeline import process_directory
 
 def get_config_dict(cfg_module) -> dict:
     """Converts all uppercase variables in a python module to a dictionary."""
     return {k: getattr(cfg_module, k) for k in dir(cfg_module) if k.isupper()}
 
 def main():
-    # Setup default paths (you can leave these blank and make them required, 
-    # but providing defaults for your specific machine speeds up daily testing)
+    # Setup default paths configured for local environment
     default_input = "/home/breallis/datasets/frog_calls/gabon_full/P2"
     default_output = "/home/breallis/datasets/frog_calls/gabon_full/P2_nn_features"
 
@@ -70,9 +69,12 @@ def main():
     print("\n[CONFIG] Loaded global config into dictionary.")
     print(f"[CONFIG] Input Directory:  {args.input_dir}")
     print(f"[CONFIG] Output Directory: {args.output_dir}")
-    print(f"[CONFIG] Checkpoint File:  {args.ckpt}\n")
+    print(f"[CONFIG] Checkpoint File:  {args.ckpt}")
+    print(f"[CONFIG] Batch Size:       {args.batch_size}")
+    print(f"[CONFIG] Stride (Seconds): {args.step_seconds}")
+    print(f"[CONFIG] Shape Parameters: MAX_BIN={config_dict.get('MAX_BIN', 8)}, N_SLICES={config_dict.get('N_SLICES', 32)}\n")
 
-    # Execute the pipeline
+    # Execute the pipeline using clean horizontal arguments
     process_directory(
         config_dict=config_dict,
         input_dir=args.input_dir,

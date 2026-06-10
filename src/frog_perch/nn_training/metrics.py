@@ -69,7 +69,7 @@ class NormalizedEarthMoversDistance1D(tf.keras.losses.Loss):
         cdf_true = tf.cumsum(y_true, axis=-1)
         cdf_pred = tf.cumsum(y_pred, axis=-1)
         
-        return tf.reduce_mean(tf.abs(cdf_true - cdf_pred), axis=-1)
+        return tf.reduce_sum(tf.abs(cdf_true - cdf_pred), axis=-1)
 
 
 @tf.keras.utils.register_keras_serializable(package="frog_perch")

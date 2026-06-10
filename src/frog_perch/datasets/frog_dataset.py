@@ -50,6 +50,8 @@ class FrogPerchDataset:
         clip_duration_seconds: float = 5.0,
         perch_sample_rate: int = 32000,
         perch_clip_seconds: float = 5.0,
+        n_slices: int = 32,
+        max_bin: int = 8,
     ):
         self.audio_dir = audio_dir
         self.annotation_dir = annotation_dir
@@ -75,6 +77,10 @@ class FrogPerchDataset:
 
         self.perch_sr = perch_sample_rate
         self.perch_samples = int(perch_sample_rate * perch_clip_seconds)
+        self.n_slices = n_slices
+        self.max_bin = max_bin
+
+        print("DATASET SLICES:", self.n_slices)
 
         self.window_stride = 0.1
 
@@ -86,6 +92,8 @@ class FrogPerchDataset:
 
         if self.train:
             self.metadata_path = self._get_metadata_path()
+
+            print("METADATA PATH:", self.metadata_path)
 
             if os.path.exists(self.metadata_path):
                 self._load_metadata()
@@ -102,13 +110,14 @@ class FrogPerchDataset:
         self._annotation_cache = {}
 
     def _get_split_path(self):
-        key = f"{self.random_seed}_{self.test_split}_{self.val_split}"
-        h = hashlib.md5(key.encode()).hexdigest()
+            # The key now reflects the explicit P2 holdout logic
+            key = f"{self.random_seed}_P2_calibration_holdout_{self.val_split}"
+            h = hashlib.md5(key.encode()).hexdigest()
 
-        return os.path.join(
-            self.audio_dir,
-            f"dataset_split_{h}.json"
-        )
+            return os.path.join(
+                self.audio_dir,
+                f"dataset_split_{h}.json"
+            )
 
 
     def _group_files_by_date_hour(self):
@@ -186,6 +195,7 @@ class FrogPerchDataset:
             f"alpha:{self.sampling_alpha}",
             f"stride:{self.window_stride}",
             f"split:{self.split_type}",
+            f"slices:{self.n_slices}", # NEW: Force a new cache if resolution changes
         ]
 
         key = "||".join(key_parts)
@@ -282,21 +292,12 @@ class FrogPerchDataset:
         )
 
     def _build_labels(self, audio_file, clip_start, clip_end):
-        """
-        Compute all label heads. 
-        The 'Ghost Bernoulli' (fn_floor) ensures all distributions are 
-        mathematically valid and prevents EMD collapse.
-        """
-        # 1. Load cached events (should return empty arrays if no events exist)
         starts, ends, bandwidths = get_event_cache(self.annotation_dir, audio_file)
-        
-        fn_floor = 1e-5 
-        n_slices = 16
 
-        # 2. Compute Overlaps and Confidence
-        # If starts/ends are empty, window_overlap will be empty [].
+        fn_floor = 1e-5
+
         window_overlap = compute_window_overlap(starts, ends, clip_start, clip_end)
-        
+
         if len(window_overlap) > 0:
             durations = ends - starts
             conf = compute_event_confidence(
@@ -305,39 +306,65 @@ class FrogPerchDataset:
             )
             window_p = window_overlap * conf
         else:
-            # No frogs in this window (or no frogs in the whole file)
+            conf = np.array([], dtype=np.float32)
             window_p = np.array([], dtype=np.float32)
 
-        # 3. Inject the "Ghost Bernoulli"
-        # This is our single source of truth for the False Negative Floor.
         window_p_with_ghost = np.append(window_p, fn_floor)
 
-        # 4. Generate Head Outputs
-        # count_probs now uses the ghost in the probability list
-        count_probs = soft_count_distribution(window_p_with_ghost, epsilon=0)
+        count_probs = soft_count_distribution(
+            window_p_with_ghost,
+            max_bin=self.max_bin,
+            epsilon=0
+        )
         binary = binary_clip_probability(window_p_with_ghost)
 
-        # 5. Slice Head
-        # If starts is empty, slice_mat is [0, 16]. prod(axis=0) becomes 1.0. Result is 0.0.
         slice_mat = compute_slice_overlap_matrix(
-            starts, ends, clip_start, clip_end, n_slices=n_slices
+            starts, ends, clip_start, clip_end,
+            n_slices=self.n_slices
         )
-        
-        # Handle confidence weighting safely for empty arrays
+
         if len(window_overlap) > 0:
             slice_p = slice_mat * conf[:, None]
             slice_out = (1.0 - np.prod(1.0 - slice_p, axis=0)).astype(np.float32)
         else:
-            slice_out = np.zeros(n_slices, dtype=np.float32)
+            slice_out = np.zeros(self.n_slices, dtype=np.float32)
 
-        return {
-            "binary": np.float32(binary),
-            "count_probs": count_probs,
-            "slice": slice_out, 
+        # ------------------------------------------------------------------
+        # Event list — slice-relative coordinates, confidence from annotation
+        # workflow unchanged. Only events with nonzero window overlap included.
+        # ------------------------------------------------------------------
+        clip_dur = clip_end - clip_start
+
+        if len(window_overlap) > 0:
+            mask = window_overlap > 0
+            ev_starts = np.clip(
+                (starts[mask] - clip_start) / clip_dur * self.n_slices, 0, self.n_slices
+            )
+            ev_ends = np.clip(
+                (ends[mask] - clip_start) / clip_dur * self.n_slices, 0, self.n_slices
+            )
+            ev_conf = conf[mask]
+        else:
+            ev_starts = np.array([], dtype=np.float32)
+            ev_ends   = np.array([], dtype=np.float32)
+            ev_conf   = np.array([], dtype=np.float32)
+
+        events = {
+            "starts": ev_starts.astype(np.float32),
+            "ends":   ev_ends.astype(np.float32),
+            "conf":   ev_conf.astype(np.float32),
         }
 
+        labels = {
+            "binary":      np.float32(binary),
+            "count_probs": count_probs,
+            "slice":       slice_out,
+        }
+
+        return labels, events
+
     def __len__(self):
-        return 10000 if self.train else len(self.val_index)
+        return 50000 if self.train else len(self.val_index)
 
     def _build_global_file_marginals(self):
         """
@@ -541,23 +568,24 @@ class FrogPerchDataset:
             clip_start = start_sample / self.sample_rate
             clip_end = clip_start + self.clip_samples / self.sample_rate
 
-            labels = self._build_labels(audio_file, clip_start, clip_end)
+            labels, events = self._build_labels(audio_file, clip_start, clip_end)
 
             # 5. Compute Perch embedding inline
             spatial_emb = self.perch.get_spatial_embedding(
                 clip_perch
             ).astype(np.float32)
 
-            return spatial_emb, labels, audio_file, start_sample
+            return spatial_emb, labels, audio_file, start_sample, events
 
     def _load_or_create_split(self):
         """
         Load existing split if present; otherwise create deterministic split.
 
         Splitting strategy:
-        - group files by recording block (date-hour key)
-        - shuffle groups deterministically using seed
-        - allocate into train/val/test partitions
+        - Extract all 'P2' microphone files exclusively into the 'test' split.
+        - Group remaining files by date-hour to prevent temporal leakage.
+        - Shuffle groups deterministically using seed.
+        - Allocate remaining files into train/val partitions.
         """
         split_path = self._get_split_path()
 
@@ -566,29 +594,52 @@ class FrogPerchDataset:
                 split = json.load(f)
             return split[self.split_type]
 
-        # Grouping prevents leakage across temporally adjacent recordings
-        groups = self._group_files_by_date_hour()
+        # 1. Isolate P2 files exclusively for Calibration (Test)
+        p2_files = []
+        other_files = []
+
+        for fname in os.listdir(self.audio_dir):
+            if not fname.endswith(".wav"):
+                continue
+            
+            # NOTE: Adjust "P2" if your filename convention requires stricter 
+            # matching (e.g., "_P2_" to prevent matching something like "P20")
+            if "P2" in fname:
+                p2_files.append(fname)
+            else:
+                other_files.append(fname)
+
+        # 2. Group the remaining files to prevent temporal leakage
+        groups = {}
+        for fname in other_files:
+            parts = fname.split("__")
+            if len(parts) < 2:
+                key = f"ungrouped_{fname}"
+            else:
+                sub = parts[1].split("_")
+                key = f"{sub[0]}_{sub[1]}"
+            groups.setdefault(key, []).append(fname)
 
         keys = list(groups.keys())
 
-        # Deterministic shuffle for reproducibility
+        # 3. Deterministic shuffle for reproducibility
         rng = random.Random(self.random_seed)
         rng.shuffle(keys)
 
+        # 4. Allocate strictly to Train / Val
         n = len(keys)
-        n_test = int(n * self.test_split)
         n_val = int(n * self.val_split)
-
+        
         split_map = {
-            "train": keys[: n - n_test - n_val],
-            "val": keys[n - n_test - n_val : n - n_test],
-            "test": keys[n - n_test :],
+            "val": keys[:n_val],
+            "train": keys[n_val:]
         }
 
-        # Expand grouped keys back into filenames
+        # 5. Expand grouped keys back into filenames
         full_split = {
-            k: sorted([f for key in v for f in groups[key]])
-            for k, v in split_map.items()
+            "train": sorted([f for key in split_map["train"] for f in groups[key]]),
+            "val": sorted([f for key in split_map["val"] for f in groups[key]]),
+            "test": sorted(p2_files)  # P2 is now exclusively the 'test' partition
         }
 
         # Persist split for reproducibility across runs

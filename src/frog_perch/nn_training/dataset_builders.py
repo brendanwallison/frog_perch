@@ -8,7 +8,7 @@ def _probe_sample(dataset_obj):
     Returns:
         (spatial_sample, label_dict_sample)
     """
-    spatial_sample, label_sample, _, _ = dataset_obj[0]
+    spatial_sample, label_sample, _, _, _ = dataset_obj[0]
     return spatial_sample, label_sample
 
 
@@ -25,7 +25,7 @@ def _train_python_gen(dataset_obj):
     length = len(dataset_obj)
 
     while True:
-        spatial, labels, audio_file, start = dataset_obj[
+        spatial, labels, audio_file, start, _ = dataset_obj[
             np.random.randint(0, length)
         ]
 
@@ -46,7 +46,7 @@ def _val_python_gen(dataset_obj):
     Finite validation generator.
     """
     for i in range(len(dataset_obj)):
-        spatial, labels, audio_file, start = dataset_obj[i]
+        spatial, labels, audio_file, start, _ = dataset_obj[i]
 
         yield (
             spatial.astype(np.float32),
@@ -85,7 +85,7 @@ def build_tf_dataset(dataset_obj, batch_size):
     label_spec = {
         "binary": tf.TensorSpec(shape=(), dtype=tf.float32),
         "count_probs": tf.TensorSpec(shape=(17,), dtype=tf.float32),
-        "slice": tf.TensorSpec(shape=(16,), dtype=tf.float32),
+        "slice": tf.TensorSpec(shape=(dataset_obj.n_slices,), dtype=tf.float32),
     }
 
     output_signature = (
@@ -129,7 +129,7 @@ def build_tf_val_dataset(dataset_obj, batch_size):
     label_spec = {
         "binary": tf.TensorSpec(shape=(), dtype=tf.float32),
         "count_probs": tf.TensorSpec(shape=(17,), dtype=tf.float32),
-        "slice": tf.TensorSpec(shape=(16,), dtype=tf.float32),
+        "slice": tf.TensorSpec(shape=(dataset_obj.n_slices,), dtype=tf.float32),
     }
 
     output_signature = (

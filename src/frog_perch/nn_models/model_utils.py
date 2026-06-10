@@ -11,7 +11,7 @@ def load_custom_model(ckpt_path: str) -> tf.keras.Model:
     layers, losses, and metrics into the Keras deserialization process.
     """
     # Import locally to avoid circular dependencies if this file gets imported early
-    from frog_perch.nn_models.downstream import SoftCountFromSlices
+    from frog_perch.nn_models.downstream import SoftCountFromSlices, LocalExpansion
     from frog_perch.nn_training.metrics import (
         AnnealedLossWrapper, 
         ExpectedCountMAE, 
@@ -20,6 +20,7 @@ def load_custom_model(ckpt_path: str) -> tf.keras.Model:
 
     custom_objects = {
         "SoftCountFromSlices": SoftCountFromSlices,
+        "LocalExpansion": LocalExpansion,
         "AnnealedLossWrapper": AnnealedLossWrapper,
         "ExpectedCountMAE": ExpectedCountMAE,
         "NormalizedEarthMoversDistance1D": NormalizedEarthMoversDistance1D,
