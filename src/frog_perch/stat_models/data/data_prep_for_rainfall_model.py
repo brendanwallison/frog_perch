@@ -24,15 +24,14 @@ def build_spline_basis(x, step_size, hard_bounds=None):
 # ---------------------------------------------------------------------
 # Main Preprocessing: Hydrological Decay Version
 # ---------------------------------------------------------------------
-def prepare_stan_data_hydrological(
+def prepare_numpyro_data_hydrological(
     df: pd.DataFrame,
     df_rain: pd.DataFrame,
     calibration_params: dict, 
     *,
-    bin_duration_sec: float = 0.2, # Kept for signature compatibility
-    window_length_sec: float = 5.0,
     knot_spacing_diel_min: float = 10.0,
     burn_in_days: int = 14,
+    w_fraction: float=0.0167,
     cache_file: str | None = None,
 ) -> tuple[dict, pd.DataFrame, dict]:
 
@@ -64,15 +63,13 @@ def prepare_stan_data_hydrological(
             "mid_time_hour": t_mid
         })
         
-        # Extract features
+        # FIXED: Isolate covariates and raw variance y_v (No norm_factor division)
         x_interf = row['log_mean_rms_1000_1500'] - x_center
-        y_mu_norm = np.clip(row['nn_mu'] / k_max, 0.001, 0.999)
-        norm_factor = (y_mu_norm * (1.0 - y_mu_norm)) + 1e-6
-        nu_obs = (row['nn_var'] / (k_max**2)) / norm_factor
+        y_v = row['nn_var'] / (k_max**2)
         
-        # Get 17-bin probability vector via imported function
+        # Get probability vector via imported function using clean mathematical bounds
         lik_vec = calculate_likelihood_vector(
-            row['nn_mu'], nu_obs, x_interf, calibration_params, k_max
+            row['nn_mu'], y_v, x_interf, calibration_params, k_max
         )
         w_obs_list.append(lik_vec)
 
@@ -125,18 +122,20 @@ def prepare_stan_data_hydrological(
     
     # --- 4. Alignment & Index Integrity ---
     window_start_times = pd.Series([m["start_time"] for m in window_metadata]).dt.normalize()
+    
+    # FIXED: NumPyro/JAX uses 0-based indexing.
     day_idx = (window_start_times - sim_start).dt.days.values
 
-    # Test 3: Index Boundary Check
+    # Test 3: Index Boundary Check (Adjusted for 0-based indexing)
     if np.any(day_idx < 0) or np.any(day_idx >= len(full_date_range)):
         raise IndexError("Mapping error: Window day_idx falls outside simulation timeline.")
     
     # Sample Test: Verify first observation alignment
     first_obs_day = full_date_range[day_idx[0]]
     if first_obs_day != audio_start:
-         raise ValueError(f"Alignment Mismatch: Index {day_idx[0]} maps to {first_obs_day}, but audio starts at {audio_start}")
+         raise ValueError(f"Alignment Mismatch: Index maps to {first_obs_day}, but audio starts at {audio_start}")
     
-    print(f" > Alignment Check: First window correctly maps to Day Index {day_idx[0]} ({first_obs_day.date()})")
+    print(f" > Alignment Check: First window correctly maps to NumPyro Index {day_idx[0]} ({first_obs_day.date()})")
     print(f"=============================\n")
 
     # Diel Spline
@@ -146,9 +145,7 @@ def prepare_stan_data_hydrological(
         hard_bounds=(17.0, 23.0)
     )
 
-    w_fraction = 1.0 / 36.0
-
-    stan_data = {
+    numpyro_data = {
         "T": len(w_obs),
         "N": int(k_max),
         "w_obs": w_obs,
@@ -165,6 +162,6 @@ def prepare_stan_data_hydrological(
 
     if cache_file:
         with open(cache_file, "wb") as f:
-            pickle.dump((stan_data, windows_df, spline_params), f)
+            pickle.dump((numpyro_data, windows_df, spline_params), f)
 
-    return stan_data, windows_df, spline_params
+    return numpyro_data, windows_df, spline_params

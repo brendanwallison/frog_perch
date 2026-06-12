@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Memory-safe, High-Performance Visualization for Hydrological Decay Model.
-Universal source of truth for model reconstruction and temporal alignment.
+Memory-Safe, High-Performance Visualization for the Pure 3-Day Linear Lag Matrix Model.
+Universal source of truth for structural cross-scale decomposition and temporal alignment.
+Updated to support Geometric Cross-Day Interactions and Bounded Tanh Gates.
 """
 
 import argparse
@@ -45,14 +46,10 @@ def preprocess_viz_metadata(windows_df, precip_daily, burn_in_days):
 # ============================================================
 
 def get_param(container, name):
-    """Handle transformed and raw param naming in Dataset or Draw dict."""
-    if hasattr(container, "data_vars"):
-        val = container.get(f"{name}_val", container.get(name))
-    else:
-        val = container.get(f"{name}_val", container.get(name))
+    val = container.get(f"{name}_val", container.get(name))
     return getattr(val, "values", val)
 
-def reconstruct_wetness_recursive(precip, hl):
+def reconstruct_slow_wetness(precip, hl):
     phi = 2 ** (-1.0 / hl)
     w = np.zeros_like(precip, dtype=float)
     for t in range(1, len(precip)):
@@ -68,35 +65,58 @@ def iterate_draws(idata):
 def get_all_decompositions(idata, viz_meta, B_diel, precip_daily):
     post = idata.posterior
     n_draws = post.sizes["chain"] * post.sizes["draw"]
-    n_days = len(viz_meta["full_calendar"])
+    n_days = len(precip_daily)
     
     decomp = {
         "beta_0": np.zeros(n_draws),
-        "rain_fast": np.zeros((n_draws, n_days)),
-        "rain_slow": np.zeros((n_draws, n_days)),
+        "fast_rain_raw": np.zeros((n_draws, n_days)),
+        "eff_slow_raw": np.zeros((n_draws, n_days)),
+        "eff_interact": np.zeros((n_draws, n_days)),
         "alpha_day": np.zeros((n_draws, n_days)),
         "diel_peak_val": np.zeros(n_draws), 
     }
 
-    print(f"⚡ Reconstructing full 110-day timeline for {n_draws} draws...")
+    p0 = precip_daily
+    p1 = np.concatenate([[0.0], precip_daily[:-1]])
+    p2 = np.concatenate([[0.0, 0.0], precip_daily[:-2]])
+    
+    # 🌟 Core Fix A: Updated to use the identical geometric mean vector from the JAX graph
+    p01_geom = np.sqrt(p0 * p1 + 1e-5)
+
+    first_draw = next(iterate_draws(idata))
+    
+    print("\n🔍 --- Loud Diagnostic Key Check ---")
+    print("Your MCMC file contains exactly these parameters:")
+    print(list(first_draw.keys()))
+    print("------------------------------------\n")
+
+    print(f"⚡ Reconstructing 3-Day Geometric Lag Matrix for {n_draws} draws...")
     for i, draw in enumerate(iterate_draws(idata)):
-        # 1. Daily Components
-        wf = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_fast"))
-        ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
+        b_p0 = draw["b_p0"]
+        b_p1 = draw["b_p1"]
+        b_p2 = draw["b_p2"]
+        b_p01 = draw["b_p01"]
         
-        wf_std = wf / (np.std(wf) + 1e-6)
-        decomp["rain_fast"][i] = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
+        # Aligned to geometric interaction representation
+        fast_rain = (b_p0 * p0) + (b_p1 * p1) + (b_p2 * p2) + (b_p01 * p01_geom)
+        decomp["fast_rain_raw"][i] = fast_rain
+
+        ws = reconstruct_slow_wetness(precip_daily, draw["half_life_slow_val"])
+        tau = draw["tau_pool"]
+        b_shape = draw["b_shape"]
+        trigger = 1.0 / (1.0 + np.exp(-b_shape * (ws - tau)))
         
-        ks = get_param(draw, "k_slow")
-        ns = get_param(draw, "n_slow")
-        ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
-        decomp["rain_slow"][i] = get_param(draw, "gamma_slow") * (ws_hill - np.mean(ws_hill))
+        gamma_plateau = draw["gamma_plateau"]
+        decomp["eff_slow_raw"][i] = gamma_plateau * trigger
         
-        decomp["alpha_day"][i] = get_param(draw, "alpha_day_raw") * get_param(draw, "sigma_day")
-        decomp["beta_0"][i] = get_param(draw, "beta_0")
+        # 🌟 Core Fix B: Cross-scale interaction mapped cleanly to np.tanh
+        b_fast_slow = draw["b_fast_slow"]
+        decomp["eff_interact"][i] = b_fast_slow * np.tanh(fast_rain) * trigger
         
-        # 2. Diel Component 
-        beta_diel = np.concatenate([[0.0], np.cumsum(get_param(draw, "z_diel_raw") * get_param(draw, "sigma_diel"))])
+        decomp["alpha_day"][i] = draw["alpha_day_raw"] * draw["b_day"]
+        decomp["beta_0"][i] = draw["beta_0"]
+        
+        beta_diel = np.concatenate([[0.0], np.cumsum(draw["z_diel_raw"] * draw["sigma_diel"])])
         decomp["diel_peak_val"][i] = np.max(B_diel @ beta_diel)
 
     return decomp
@@ -110,8 +130,14 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
     n_days = len(days)
     
     plt.figure(figsize=(15, 8))
-    colors = {"beta_0": "gray", "rain_fast": "blue", "rain_slow": "cyan", 
-              "alpha_day": "purple", "diel_peak_val": "orange"}
+    colors = {
+        "beta_0": "gray", 
+        "fast_rain_raw": "blue", 
+        "eff_slow_raw": "cyan", 
+        "eff_interact": "magenta",
+        "alpha_day": "purple", 
+        "diel_peak_val": "orange"
+    }
     
     total_log_lambda = np.zeros_like(decomp["alpha_day"])
     
@@ -130,7 +156,7 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
                  label="Total Influence", linewidth=0, elinewidth=1.5, alpha=0.8, zorder=10, markersize=4)
 
     plt.axhline(0, color='black', linestyle='--', alpha=0.3)
-    plt.title("Log-Intensity Decomposition (Baseline Model)")
+    plt.title("Log-Intensity Decomposition (Geometric Mean & Tanh Matrix Constraints)")
     plt.ylabel("Log-scale Contribution")
     plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
     plt.xticks(rotation=45)
@@ -139,8 +165,9 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
 
 def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
     days = viz_meta["full_calendar"]
-    total_log = (decomp["beta_0"][:, None] + decomp["rain_fast"] + 
-                 decomp["rain_slow"] + decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
+    total_log = (decomp["beta_0"][:, None] + decomp["fast_rain_raw"] + 
+                 decomp["eff_slow_raw"] + decomp["eff_interact"] + 
+                 decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
     
     lam = np.exp(total_log)
     mu, lo, hi = np.nanmedian(lam, 0), np.nanpercentile(lam, 2.5, 0), np.nanpercentile(lam, 97.5, 0)
@@ -155,7 +182,7 @@ def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
     plt.savefig(Path(output_dir) / "seasonal_peak_intensity_log.png"); plt.close()
 
 def plot_day_random_effects(idata, viz_meta, output_dir):
-    alpha = (idata.posterior.alpha_day_raw * idata.posterior.sigma_day).values
+    alpha = (idata.posterior.alpha_day_raw * idata.posterior.b_day).values
     flat = alpha.reshape(-1, alpha.shape[-1])
     mu, lo, hi = np.median(flat, 0), np.percentile(flat, 2.5, 0), np.percentile(flat, 97.5, 0)
     plt.figure(figsize=(14, 5)); plt.axhline(0, color='black', ls='--')
@@ -177,99 +204,106 @@ def plot_learned_diel_cycle(idata, B_diel, windows_df, output_dir):
     ax2.plot(u_h, np.exp(mu), color='navy'); ax2.set_ylabel(r"Multiplicative Factor ($\exp$)")
     plt.savefig(Path(output_dir) / "learned_diel_cycle.png", dpi=150); plt.close()
 
-def plot_dual_rainfall_decay(idata, precip_daily, output_dir):
-    wf_l, ws_l, sat_l = [], [], []
+def plot_structural_hydrology_and_lags(idata, precip_daily, output_dir):
+    trigger_l = []
     for d in iterate_draws(idata):
-        wf = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_fast"))
-        ws = reconstruct_wetness_recursive(precip_daily, get_param(d, "half_life_slow"))
-        ks = get_param(d, "k_slow")
-        ns = get_param(d, "n_slow")
-        sat = (ws ** ns) / (ks ** ns + ws ** ns)
-        wf_l.append(wf); ws_l.append(ws); sat_l.append(sat)
+        ws = reconstruct_slow_wetness(precip_daily, get_param(d, "half_life_slow"))
+        tau = get_param(d, "tau_pool")
+        b_shape = get_param(d, "b_shape")
+        trigger = 1.0 / (1.0 + np.exp(-b_shape * (ws - tau)))
+        trigger_l.append(trigger)
     
     days = np.arange(len(precip_daily))
-    fig, ax = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, ax = plt.subplots(2, 1, figsize=(12, 10))
     
-    ax[0].bar(days, precip_daily, alpha=0.15, color='blue', label="Precip")
+    # Plot A: Slow Switch Context
+    ax[0].bar(days, precip_daily, alpha=0.15, color='blue')
     axt0 = ax[0].twinx()
-    arr_f = np.array(wf_l)
-    axt0.plot(days, arr_f.mean(0), color='tab:blue', label="Fast Wetness ($W_f$)")
-    axt0.fill_between(days, np.percentile(arr_f, 2.5, 0), np.percentile(arr_f, 97.5, 0), color='tab:blue', alpha=0.2)
-    ax[0].set_title("Fast Hydrological Scale (Linear)")
+    axt0.plot(days, np.array(trigger_l).mean(0), color='tab:green', lw=2, label="Seasonal Carrying Capacity Gate (0 to 1)")
+    ax[0].set_title("Slow Integrator Core State")
+    axt0.legend(loc='upper left')
 
-    ax[1].bar(days, precip_daily, alpha=0.15, color='blue')
-    axt1 = ax[1].twinx()
-    arr_s, arr_sat = np.array(ws_l), np.array(sat_l)
-    axt1.plot(days, arr_s.mean(0), color='tab:cyan', ls='--', alpha=0.6, label="Raw Slow ($W_s$)")
-    axt1.plot(days, arr_sat.mean(0), color='tab:red', lw=2, label="Hill Effect ($Hill(W_s)$)")
-    axt1.fill_between(days, np.percentile(arr_sat, 2.5, 0), np.percentile(arr_sat, 97.5, 0), color='tab:red', alpha=0.2)
-    ax[1].set_title("Slow Hydrological Scale (Saturation)")
+    # Plot B: Posterior Marginals of the Learnable 3-Day Lags
+    post = idata.posterior
+    lag_names = ["b_p0 (Day-Of)", "b_p1 (Lag 1)", "b_p2 (Lag 2)", "b_p01 (Geometric Cross)"]
+    lag_vars = [post["b_p0"].values.flatten(), post["b_p1"].values.flatten(), 
+                post["b_p2"].values.flatten(), post["b_p01"].values.flatten()]
     
-    plt.tight_layout()
-    plt.savefig(Path(output_dir) / "hydrological_dual_decay.png", dpi=150); plt.close()
+    for val, name in zip(lag_vars, lag_names):
+        az.plot_kde(val, ax=ax[1], label=name)
+    ax[1].axvline(0.0, color='black', ls='--', alpha=0.5)
+    ax[1].set_title("Posterior Distributions of Short-Term Linear Memory Matrix")
+    ax[1].set_xlabel("Parameter Value (Log-scale Impact)")
+    ax[1].legend()
 
-def plot_hydrological_half_life(idata, output_dir):
-    plt.figure(figsize=(10, 6))
-    az.plot_kde(get_param(idata.posterior, "half_life_fast").flatten(), label="Fast")
-    az.plot_kde(get_param(idata.posterior, "half_life_slow").flatten(), label="Slow")
-    plt.legend(); plt.savefig(Path(output_dir) / "hydrological_half_life_kde.png"); plt.close()
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / "hydrological_structural_lags.png", dpi=150); plt.close()
 
 def plot_mcmc_health(idata, output_dir):
     vars = [v for v in idata.posterior.data_vars if len(idata.posterior[v].dims) <= 3]
-    az.plot_rank(idata, var_names=vars, kind="vlines"); plt.savefig(Path(output_dir) / "rank_plot.png"); plt.close()
+    plot_vars = vars[:40] if len(vars) > 40 else vars
+    az.plot_rank(idata, var_names=plot_vars, kind="vlines"); plt.savefig(Path(output_dir) / "rank_plot.png"); plt.close()
     az.summary(idata, var_names=vars).to_csv(Path(output_dir) / "mcmc_summary.csv")
 
 def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
     all_t = []
+    p0 = precip_daily
+    p1 = np.concatenate([[0.0], precip_daily[:-1]])
+    p2 = np.concatenate([[0.0, 0.0], precip_daily[:-2]])
+    
+    # 🌟 Core Fix C: Re-apply geometric tracking alignment here
+    p01_geom = np.sqrt(p0 * p1 + 1e-5)
+
     for draw in iterate_draws(idata):
-        wf = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_fast"))
-        ws = reconstruct_wetness_recursive(precip_daily, get_param(draw, "half_life_slow"))
+        fast_rain = (get_param(draw, "b_p0") * p0) + (get_param(draw, "b_p1") * p1) + \
+                    (get_param(draw, "b_p2") * p2) + (get_param(draw, "b_p01") * p01_geom)
         
-        wf_std = wf / (np.std(wf) + 1e-6)
-        r_f = get_param(draw, "gamma_fast") * (wf_std - np.mean(wf_std))
+        ws = reconstruct_slow_wetness(precip_daily, get_param(draw, "half_life_slow"))
+        trigger = 1.0 / (1.0 + np.exp(-get_param(draw, "b_shape") * (ws - get_param(draw, "tau_pool"))))
         
-        ks = get_param(draw, "k_slow")
-        ns = get_param(draw, "n_slow")
-        ws_hill = (ws ** ns) / (ks ** ns + ws ** ns)
+        r_s = get_param(draw, "gamma_plateau") * trigger
         
-        r_s = get_param(draw, "gamma_slow") * (ws_hill - np.mean(ws_hill))
-        all_t.append(r_f + r_s)
+        # 🌟 Core Fix D: Re-apply tanh bounds alignment here
+        r_interact = get_param(draw, "b_fast_slow") * np.tanh(fast_rain) * trigger
+        
+        all_t.append(fast_rain + r_s + r_interact)
         
     mu, lo, hi = np.mean(all_t, 0), np.percentile(all_t, 2.5, 0), np.percentile(all_t, 97.5, 0)
-    plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu)
-    plt.fill_between(viz_meta["full_calendar"], lo, hi, alpha=0.2)
-    plt.title("Total Rain Influence"); plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
+    plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu, color='dodgerblue')
+    plt.fill_between(viz_meta["full_calendar"], lo, hi, alpha=0.2, color='dodgerblue')
+    plt.title("Total Hydrological Influence Matrix (Combined Weather Trackers)")
+    plt.ylabel("Net Combined Log-scale Effect")
+    plt.savefig(Path(output_dir) / "total_rain_influence.png"); plt.close()
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/home/breallis/dev/frog_perch/stat_results/call_intensity_spline_rainfall_climate_calibrated_v7"),
-        help="Directory containing inference outputs (default: current directory)"
+        default=Path("/home/breallis/dev/frog_perch/stat_results/model_final"),
+        help="Directory containing inference outputs"
     )
     args = parser.parse_args()
 
-    # Load Data
+    # Load NetCDF and Structural Matrices
     idata = az.from_netcdf(args.output_dir / "inference_data_rain.nc")
     windows_df = pd.read_csv(args.output_dir / "windowed_detector_data.csv")
     m_params = np.load(args.output_dir / "model_params.npz")
     
-    # Process & Align
+    # Process & Align Slices Natively
     viz_meta = preprocess_viz_metadata(windows_df, m_params["precip_daily"], int(m_params["burn_in_days"]))
     decomp = get_all_decompositions(idata, viz_meta, m_params["B_diel"], m_params["precip_daily"])
 
-    # Build Plots
+    # Build Realigned Plots Suite
     plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, args.output_dir)
     plot_additive_component_synthesis(decomp, viz_meta, args.output_dir)
     plot_mcmc_health(idata, args.output_dir)
-    plot_hydrological_half_life(idata, args.output_dir)
-    plot_dual_rainfall_decay(idata, m_params["precip_daily"], args.output_dir)
+    plot_structural_hydrology_and_lags(idata, m_params["precip_daily"], args.output_dir)
     plot_learned_diel_cycle(idata, m_params["B_diel"], windows_df, args.output_dir)
     plot_day_random_effects(idata, viz_meta, args.output_dir)
     plot_total_rain_influence(idata, viz_meta, m_params["precip_daily"], args.output_dir)
     
-    print("✅ Full Baseline Visualization Suite complete.")
+    print("✅ Geometric Matrix & Tanh Bounded Visualization Suite complete.")
 
 if __name__ == "__main__":
     main()

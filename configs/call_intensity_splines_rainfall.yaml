@@ -9,16 +9,16 @@ rain_csv: /home/breallis/datasets/frog_calls/gabon_rainfall_2024_full.csv
 climate_csv: /home/breallis/datasets/frog_calls/pond1_2024_Climate_data.csv
 
 # The parameters learned by the MLE calibration script
-calibration_json_path: /home/breallis/dev/frog_perch/checkpoints/pool=slice_loss=slice_x0=-3.0_k=1.0.keras_multiband_calibration_calibrated_v2.json
+calibration_json_path: /home/breallis/dev/frog_perch/checkpoints/model_final/best.keras_multiband_calibration_calibrated_v2.json
 
 # Output directory for the ArviZ inference data
-output_dir: stat_results/call_intensity_spline_rainfall_climate_calibrated_v8
+output_dir: stat_results/model_final
 
 # ---------------------------------------------------------
 # MCMC Settings
 # ---------------------------------------------------------
-warmup: 250
-sampling: 1000
+warmup: 100
+sampling: 500
 chains: 2
 seed: 20250101
 
@@ -33,3 +33,5 @@ window_length_sec: 5.0
 # Smaller spacing = More knots = Higher flexibility.
 knot_spacing_diel_min: 10.0     # Knot every 10 minutes
 burn_in_days: 30
+
+w_fraction: 0.0167

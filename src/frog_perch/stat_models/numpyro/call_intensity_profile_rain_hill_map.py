@@ -2,7 +2,9 @@ import jax
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, init_to_median
+from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer.autoguide import AutoDelta
+import numpyro.optim as optim
 
 jax.config.update("jax_enable_x64", True)
 
@@ -14,7 +16,6 @@ def model(data_dict):
     day_idx       = data_dict["day_idx"]
     num_days      = data_dict["num_days"]
     w_fraction    = data_dict.get("w_fraction", 0.0167)
-    use_burst     = data_dict.get("use_burst", 1.0) # Toggle burst on/off
    
     T, _ = w_obs.shape
     _, K_diel = B_diel.shape
@@ -107,9 +108,9 @@ def model(data_dict):
     scaled_log_prob = log_lik_per_window.sum() * w_fraction
     numpyro.factor("obs_log_prob", scaled_log_prob)
 
-def compile_and_run(stan_data, num_warmup=1000, num_samples=1000, num_chains=4, seed=0):
-    print(f"🚀 Initializing NUTS MCMC Engine with {num_chains} Parallel Chains...")
-    
+
+def compile_and_run(stan_data, num_steps=5000, seed=0, use_burst=1.0):
+    print("🚀 Compiling JAX model for Baseline Unscaled MAP Optimization...")
     data_dict = {
         "w_obs":         jnp.array(stan_data["w_obs"]),
         "precip_daily":  jnp.array(stan_data["precip_daily"]),
@@ -117,24 +118,47 @@ def compile_and_run(stan_data, num_warmup=1000, num_samples=1000, num_chains=4, 
         "N":             stan_data["N"],
         "day_idx":       jnp.array(stan_data["day_idx"]),
         "num_days":      stan_data["num_days"],
-        "w_fraction":    jnp.array(stan_data.get("w_fraction", 0.0167), dtype=jnp.float64),
+        "w_fraction":    jnp.array(stan_data["w_fraction"]),
+        "use_burst":     jnp.array(use_burst, dtype=jnp.float64)
     }
-    
-    nuts_kernel = NUTS(model, target_accept_prob=0.92, init_strategy=init_to_median, max_tree_depth=10)
-    
-    mcmc = MCMC(
-        nuts_kernel, 
-        num_warmup=num_warmup, 
-        num_samples=num_samples, 
-        num_chains=num_chains, 
-        chain_method='parallel', 
-        progress_bar=True
-    )
-    
+
+    guide = AutoDelta(model)
+    optimizer = optim.Adam(step_size=0.01)
+    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+
     rng_key = jax.random.PRNGKey(seed)
-    mcmc.run(rng_key, data_dict)
-    
-    print("\n📊 --- NUTS Sampling Post-Processing Complete ---")
-    mcmc.print_summary()
-    
-    return mcmc
+    svi_result = svi.run(rng_key, num_steps, data_dict)
+   
+    # Extract point estimates
+    map_params = svi_result.params
+    final_loss = svi_result.losses[-1]
+   
+    # --- Instant Diagnostics ---
+    b_day_val = float(map_params.get("b_day_auto_loc", 0.0))
+   
+    # Calculate Random Effect Variance
+    alpha_raw = map_params.get("alpha_day_raw_auto_loc", jnp.zeros(stan_data["num_days"]))
+    actual_alphas = alpha_raw * b_day_val
+    alpha_var = float(jnp.var(actual_alphas))
+    alpha_abs_mean = float(jnp.mean(jnp.abs(actual_alphas)))
+   
+    # Approximate BIC
+    k = sum(v.size for k, v in map_params.items())
+    n = stan_data["w_obs"].shape[0] * stan_data["w_obs"].shape[1]
+    bic = k * jnp.log(n) + 2 * final_loss
+
+    print("\n📊 --- MAP Convergence & Structural Diagnostics ---")
+    print(f"📉 Final Loss (Neg Log-Post):  {final_loss:.2f}")
+    print(f"⚖️ Approx BIC (k={k}):         {bic:.2f}")
+    print(f"🎛️ b_day (Hierarch. Shrink):   {b_day_val:.4f}")
+    print(f"📈 Alpha_day (Abs Mean):       {alpha_abs_mean:.4f}")
+    print(f"📈 Alpha_day (Variance):       {alpha_var:.4f}")
+    print("\n🌧️  --- Optimized 3-Day Pure Linear Rain Weights ---")
+    print(f"💧 b_p0  (Day-Of Pulse):         {float(map_params['b_p0_auto_loc']):.4f}")
+    print(f"⏱️  b_p1  (1-Day Lag Recovery):   {float(map_params['b_p1_auto_loc']):.4f}")
+    print(f"⏳ b_p2  (2-Day Lag Recovery):   {float(map_params['b_p2_auto_loc']):.4f}")
+    print(f"🔄 b_p01 (Consecutive Day Mult): {float(map_params['b_p01_auto_loc']):.4f}")
+    print(f"⚡ b_fast_slow (Seasonal Gate): {float(map_params['b_fast_slow_auto_loc']):.4f}")
+    print("-------------------------------------------\n")
+
+    return svi_result, guide

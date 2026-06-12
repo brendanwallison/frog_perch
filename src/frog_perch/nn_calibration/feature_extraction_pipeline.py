@@ -5,7 +5,8 @@ from pathlib import Path
 
 from frog_perch.utils.audio import load_audio, resample_array
 from frog_perch.nn_models.perch_wrapper import PerchWrapper
-from frog_perch.nn_calibration.feature_extraction import load_custom_model, build_feature_record
+from frog_perch.nn_models.model_utils import load_custom_model
+from frog_perch.nn_calibration.feature_extraction import build_feature_record
 
 def process_file(path_audio: Path, model, perch: PerchWrapper, out_csv: Path, batch_size: int, step_seconds: float, config_dict: dict) -> None:
     """Processes field recordings by sliding a temporal extraction window over raw audio."""
