@@ -58,7 +58,7 @@ def model(data_dict):
    
     trigger = 1.0 / (1.0 + jnp.exp(-b_shape * (w_s_raw - tau_pool)))
 
-    gamma_plateau = numpyro.sample("gamma_plateau", dist.Normal(0.0, 2.0))
+    gamma_plateau = numpyro.sample("gamma_plateau", dist.Normal(0.0, 1.0))
     eff_slow_raw = gamma_plateau * trigger
 
     # --- 5. Cross-Scale Interaction (Bounded Nonlinear) ---
@@ -109,7 +109,7 @@ def model(data_dict):
     numpyro.factor("obs_log_prob", scaled_log_prob)
 
 
-def compile_and_run(stan_data, num_steps=5000, seed=0, use_burst=1.0):
+def compile_and_run(stan_data, num_steps=5000, seed=0):
     print("🚀 Compiling JAX model for Baseline Unscaled MAP Optimization...")
     data_dict = {
         "w_obs":         jnp.array(stan_data["w_obs"]),
@@ -118,8 +118,7 @@ def compile_and_run(stan_data, num_steps=5000, seed=0, use_burst=1.0):
         "N":             stan_data["N"],
         "day_idx":       jnp.array(stan_data["day_idx"]),
         "num_days":      stan_data["num_days"],
-        "w_fraction":    jnp.array(stan_data["w_fraction"]),
-        "use_burst":     jnp.array(use_burst, dtype=jnp.float64)
+        "w_fraction":    jnp.array(stan_data["w_fraction"])
     }
 
     guide = AutoDelta(model)
