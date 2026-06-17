@@ -34,16 +34,18 @@ def main():
     
     df_raw = load_detector_csvs(Path(cfg["csv_dir"]))
     df_rain = pd.read_csv(Path(cfg["rain_csv"]))
+    df_climate = pd.read_csv(cfg["climate_csv"])
     with open(Path(cfg["calibration_json_path"]), 'r') as f:
         calib_params = json.load(f)
     
     print("🛠️ Preparing Hydrological Decay data...")
     numpyro_data, windows_df, params = prepare_numpyro_data_hydrological(
-        df_raw, df_rain,
+        df_raw, df_rain, df_climate,
         calibration_params=calib_params,
         knot_spacing_diel_min=cfg["knot_spacing_diel_min"],
         burn_in_days=cfg.get("burn_in_days", 14),
         w_fraction=cfg.get("w_fraction", 0.0167),
+        output_dir=output_dir
     )
     
     print("🔥 Starting Parallel NUTS Chains (NumPyro Baseline Model)...")
@@ -61,7 +63,15 @@ def main():
         mcmc,
         constant_data={
             "w_obs": numpyro_data["w_obs"], 
-            "precip_daily": numpyro_data["precip_daily"]
+            "precip_daily": numpyro_data["precip_daily"],
+            # 🌟 Sourced exactly from the decoupled prep dictionary
+            "temp_inter": numpyro_data["temp_inter"],
+            "temp_intra": numpyro_data["temp_intra"],
+            "rh_inter": numpyro_data["rh_inter"],
+            "rh_intra": numpyro_data["rh_intra"],
+            "light_inter": numpyro_data["light_inter"],
+            "light_intra": numpyro_data["light_intra"],
+            "rms_obs": numpyro_data["rms_obs"]
         },
         dims={
             "alpha_day_raw": ["day_id"],
@@ -75,26 +85,41 @@ def main():
     idata.to_netcdf(output_dir / "inference_data_rain.nc")
     
     windows_df.to_csv(output_dir / "windowed_detector_data.csv", index=False)
+    
+    # 🌟 Removed B_diel and updated to save the dynamic basis parameters
     np.savez(
         output_dir / "model_params.npz", 
         burn_in_days=params["burn_in_days"],
         precip_daily=numpyro_data["precip_daily"], 
-        B_diel=numpyro_data["B_diel"]
+        knots_grid=numpyro_data["knots_grid"], 
+        time_of_day=numpyro_data["time_of_day"],
+        temp_inter=numpyro_data["temp_inter"],
+        temp_intra=numpyro_data["temp_intra"],
+        rh_inter=numpyro_data["rh_inter"],
+        rh_intra=numpyro_data["rh_intra"],
+        light_inter=numpyro_data["light_inter"],
+        light_intra=numpyro_data["light_intra"],
+        rms_obs=numpyro_data["rms_obs"]
     )
     
     # --- Aligned ArviZ Summary Variable Target Block ---
     print("\n=== Parameter Convergence & Summary ===")
     vars_to_summary = [
-        "beta_0", "phi", "b_p0", "b_p1", "b_p2", "b_p01",
+        "beta_0", "phi", "b_p0", "b_p1", "b_p2", 
         "half_life_slow_val", "tau_pool_val", "b_shape_val",
-        "gamma_plateau_val", "b_fast_slow", "sigma_diel", "b_day"
+        "gamma_plateau_val", "b_rms_val",
+        "b_temp_inter_val", "b_temp_intra_val", 
+        "b_rh_inter_val", "b_rh_intra_val", 
+        "b_light_inter_val", "b_light_intra_val",
+        "sigma_diel", "b_day_val", "delta_seasonal_val"
     ]
     
-    # Render diagnostics table
-    summary_df = az.summary(idata, var_names=vars_to_summary)
+    # Guard against missing keys if you drop interaction terms
+    available_vars = [v for v in vars_to_summary if v in idata.posterior]
+    
+    summary_df = az.summary(idata, var_names=available_vars)
     print(summary_df)
     
-    # Optional diagnostic warning for sampling health
     max_rhat = summary_df["r_hat"].max()
     print(f"\n📈 Maximum R-hat value across core tracking blocks: {max_rhat:.4f}")
     if max_rhat > 1.05:

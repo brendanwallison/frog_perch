@@ -6,18 +6,60 @@ from numpyro.infer import MCMC, NUTS, init_to_median
 
 jax.config.update("jax_enable_x64", True)
 
+# The Canonical JAX-Native Vectorized Cubic B-Spline Basis Generator
+# The Canonical JAX-Native Vectorized Cubic B-Spline Basis Generator
+def jax_b3_spline_basis(x, knots, low_bound=17.0, up_bound=23.0):
+    # Fix #1: Apply 4 repetitions (degree + 1) for boundary clamping
+    all_knots = jnp.concatenate([
+        jnp.repeat(low_bound, 4), 
+        knots, 
+        jnp.repeat(up_bound, 4)
+    ])
+    x_clip = jnp.clip(x, low_bound, up_bound)
+    
+    n_knots = len(all_knots)
+    n_bases = n_knots - 1
+    
+    # Fix #2: Handle the right-edge closed interval
+    is_last = (x_clip[:, None] >= all_knots[-2]) & (x_clip[:, None] <= all_knots[-1])
+    is_others = (x_clip[:, None] >= all_knots[:-1]) & (x_clip[:, None] < all_knots[1:])
+    
+    # Mask for the 0th degree basis
+    mask = jnp.where(is_last, True, is_others)
+    B = [jnp.where(mask, 1.0, 0.0)]
+    
+    for deg in range(1, 4):
+        B_next = []
+        for i in range(n_bases - deg):
+            denom1 = all_knots[i + deg] - all_knots[i]
+            denom2 = all_knots[i + deg + 1] - all_knots[i + 1]
+            
+            d1_safe = jnp.where(denom1 > 0, denom1, 1.0)
+            d2_safe = jnp.where(denom2 > 0, denom2, 1.0)
+            
+            term1 = jnp.where(denom1 > 0, 1.0, 0.0) * ((x_clip - all_knots[i]) / d1_safe) * B[-1][:, i]
+            term2 = jnp.where(denom2 > 0, 1.0, 0.0) * ((all_knots[i + deg + 1] - x_clip) / d2_safe) * B[-1][:, i + 1]
+            
+            B_next.append((term1 + term2)[:, None])
+            
+        B.append(jnp.hstack(B_next))
+        
+    return B[-1]
+
 def model(data_dict):
     w_obs         = data_dict["w_obs"]
     precip_daily  = data_dict["precip_daily"]
-    B_diel        = data_dict["B_diel"]
     N             = data_dict["N"]
     day_idx       = data_dict["day_idx"]
     num_days      = data_dict["num_days"]
     w_fraction    = data_dict.get("w_fraction", 0.0167)
-    use_burst     = data_dict.get("use_burst", 1.0) # Toggle burst on/off
+    rms_obs       = data_dict["rms_obs"]  
+    
+    time_of_day   = data_dict["time_of_day"]
+    knots_grid    = data_dict["knots_grid"]
+    doy_smooth    = data_dict["doy_smooth"]
+    K_diel_static = data_dict["K_diel_static"] 
    
-    T, _ = w_obs.shape
-    _, K_diel = B_diel.shape
     k_seq = jnp.arange(N + 1)
 
     # --- 1. Global Parameters ---
@@ -34,7 +76,7 @@ def model(data_dict):
 
     _, w_s_raw = jax.lax.scan(lambda c, p: wetness_update(phi_s, c, p), 0.0, precip_daily)
 
-    # --- 3. Fast Hydrology (3-Day Matrix - Bounded Geometric Interaction) ---
+    # --- 3. Fast Hydrology (3-Day Matrix) ---
     p0 = precip_daily
     p1 = jnp.concatenate([jnp.array([0.0]), precip_daily[:-1]])
     p2 = jnp.concatenate([jnp.array([0.0, 0.0]), precip_daily[:-2]])
@@ -42,63 +84,62 @@ def model(data_dict):
     b_p0 = numpyro.sample("b_p0", dist.Normal(0.0, 1.0))
     b_p1 = numpyro.sample("b_p1", dist.Normal(0.0, 1.0))
     b_p2 = numpyro.sample("b_p2", dist.Normal(0.0, 1.0))
-    
-    # Standard normal prior now perfectly matches the physical scale of the others
-    b_p01 = numpyro.sample("b_p01", dist.Normal(0.0, 1.0))
+    fast_rain_raw = (b_p0 * p0) + (b_p1 * p1) + (b_p2 * p2) 
 
-    # Bounded square root interaction prevents product compounding
-    p01_geom = jnp.sqrt(p0 * p1 + 1e-5)
-
-    fast_rain_raw = (b_p0 * p0) + (b_p1 * p1) + (b_p2 * p2) + (b_p01 * p01_geom)
-
-    # --- 4. Slow Effects & Scaling (Simple Plateau / No Habituation Model) ---
+    # --- 4. Slow Seasonal Plateau Scaling ---
     tau_pool = numpyro.sample("tau_pool", dist.HalfNormal(10.0))
     b_shape = numpyro.sample("b_shape", dist.HalfNormal(5.0))
-   
     trigger = 1.0 / (1.0 + jnp.exp(-b_shape * (w_s_raw - tau_pool)))
-
-    gamma_plateau = numpyro.sample("gamma_plateau", dist.Normal(0.0, 2.0))
+    gamma_plateau = numpyro.sample("gamma_plateau", dist.Normal(0.0, 1.0))
     eff_slow_raw = gamma_plateau * trigger
+    total_rain_effect = (fast_rain_raw + eff_slow_raw)[day_idx]
 
-    # --- 5. Cross-Scale Interaction (Bounded Nonlinear) ---
-    b_fast_slow = numpyro.sample("b_fast_slow", dist.Normal(0.0, 1.0))
+    # --- 5. Linear Decoupled Climate Slopes ---
+    b_rms         = numpyro.sample("b_rms", dist.Normal(0.0, 1.0))
+    b_temp_inter  = numpyro.sample("b_temp_inter", dist.Normal(0.0, 1.0))
+    b_temp_intra  = numpyro.sample("b_temp_intra", dist.Normal(0.0, 1.0))
+    b_rh_inter    = numpyro.sample("b_rh_inter", dist.Normal(0.0, 1.0))
+    b_rh_intra    = numpyro.sample("b_rh_intra", dist.Normal(0.0, 1.0))
+    b_light_inter = numpyro.sample("b_light_inter", dist.Normal(0.0, 1.0))
+    b_light_intra = numpyro.sample("b_light_intra", dist.Normal(0.0, 1.0))
+
+    # --- 6. Latent Time-Warping Phase Shift ---
+    delta_seasonal = numpyro.sample("delta_seasonal", dist.Normal(0.0, 0.5))
+    warped_time = time_of_day + (delta_seasonal * doy_smooth)
     
-    # jnp.tanh caps the daily vector magnitude, preventing runaway compounding
-    eff_interact = b_fast_slow * jnp.tanh(fast_rain_raw) * trigger
-    
-    total_rain_effect = fast_rain_raw + eff_slow_raw + eff_interact
+    B_warped = jax_b3_spline_basis(warped_time, knots_grid, low_bound=17.0, up_bound=23.0)
 
-    # # Ridge penalty factor: Slopes the flat wet-season non-identifiability ridge.
-    # # Evaluates to a completely negligible penalty at your baseline values (~0.007),
-    # # but strictly prevents NUTS chains from drifting into wild triple-digit valleys.
-    # ridge_penalty = 0.001 * (jnp.square(b_p0) + jnp.square(b_p1) + jnp.square(b_p2))
-    # numpyro.factor("ridge_penalty", -ridge_penalty)
+    sigma_diel = numpyro.sample("sigma_diel", dist.HalfNormal(1.0))
+    z_diel_raw = numpyro.sample("z_diel_raw", dist.Normal(0, 1).expand([K_diel_static - 1]))
+    beta_diel = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(z_diel_raw * sigma_diel)])
+    trend_diel = jnp.dot(B_warped, beta_diel)
 
-    total_rain_effect = (fast_rain_raw + eff_slow_raw + eff_interact)[day_idx]
-
-    # --- 6. Diel & Day-Level Effects (Laplace) ---
-    sigma_diel = numpyro.sample("sigma_diel", dist.HalfNormal(0.2))
+    # --- 7. Noise Suppression & Day Random Effects ---
     b_day = numpyro.sample("b_day", dist.HalfNormal(0.1))
-   
-    alpha_day_raw = numpyro.sample("alpha_day_raw", dist.Laplace(0.0, 1.0).expand([num_days]))
+    alpha_day_raw = numpyro.sample("alpha_day_raw", dist.Normal(0.0, 1.0).expand([num_days]))
     alpha_day = alpha_day_raw * b_day
 
-    z_diel_raw = numpyro.sample("z_diel_raw", dist.Normal(0, 1).expand([K_diel - 1]))
-    beta_diel = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(z_diel_raw * sigma_diel)])
-    trend_diel = jnp.dot(B_diel, beta_diel)
-
-    # --- 7. Final Rate ---
-    log_lambda = beta_0 + total_rain_effect + trend_diel + alpha_day[day_idx]
+    # --- 8. Rate Calculation ---
+    log_lambda = (beta_0 + total_rain_effect + trend_diel + (b_rms * rms_obs) + 
+                  (data_dict["temp_inter"] * b_temp_inter)  + (data_dict["temp_intra"] * b_temp_intra) + 
+                  (data_dict["rh_inter"]   * b_rh_inter)    + (data_dict["rh_intra"]   * b_rh_intra) + 
+                  (data_dict["light_inter"]* b_light_inter) + (data_dict["light_intra"]* b_light_intra) + 
+                  alpha_day[day_idx])
     lambd = jnp.exp(log_lambda)
 
-    # --- 8. Deterministic tracking ---
+    # --- 9. Deterministic Tracking ---
+    numpyro.deterministic("delta_seasonal_val", delta_seasonal)
     numpyro.deterministic("half_life_slow_val", half_life_slow)
-    numpyro.deterministic("tau_pool_val", tau_pool)
-    numpyro.deterministic("b_shape_val", b_shape)
-    numpyro.deterministic("gamma_plateau_val", gamma_plateau)
     numpyro.deterministic("b_day_val", b_day)
+    numpyro.deterministic("b_rms_val", b_rms)
+    numpyro.deterministic("b_temp_inter_val", b_temp_inter)
+    numpyro.deterministic("b_temp_intra_val", b_temp_intra)
+    numpyro.deterministic("b_rh_inter_val", b_rh_inter)
+    numpyro.deterministic("b_rh_intra_val", b_rh_intra)
+    numpyro.deterministic("b_light_inter_val", b_light_inter)
+    numpyro.deterministic("b_light_intra_val", b_light_intra)
 
-    # --- 9. Likelihood ---
+    # --- 10. Likelihood ---
     nb_dist = dist.NegativeBinomial2(mean=lambd[:, None], concentration=phi_nb)
     log_bio = nb_dist.log_prob(k_seq[None, :])
     log_det = jnp.log(w_obs + 1e-15)
@@ -113,13 +154,24 @@ def compile_and_run(stan_data, num_warmup=1000, num_samples=1000, num_chains=4, 
     data_dict = {
         "w_obs":         jnp.array(stan_data["w_obs"]),
         "precip_daily":  jnp.array(stan_data["precip_daily"]),
-        "B_diel":        jnp.array(stan_data["B_diel"]),
+        # 🌟 REMOVED: "B_diel" - the model handles this now
+        "knots_grid":    jnp.array(stan_data["knots_grid"]), # ADDED
+        "time_of_day":   jnp.array(stan_data["time_of_day"]), # ADDED
+        "doy_smooth":    jnp.array(stan_data["doy_smooth"]),   # ADDED
+        "K_diel_static": stan_data["K_diel_static"],          # ADDED
         "N":             stan_data["N"],
         "day_idx":       jnp.array(stan_data["day_idx"]),
         "num_days":      stan_data["num_days"],
         "w_fraction":    jnp.array(stan_data.get("w_fraction", 0.0167), dtype=jnp.float64),
+        "rms_obs":       jnp.array(stan_data["rms_obs"]),
+        "temp_inter":    jnp.array(stan_data["temp_inter"]),
+        "temp_intra":    jnp.array(stan_data["temp_intra"]),
+        "rh_inter":      jnp.array(stan_data["rh_inter"]),
+        "rh_intra":      jnp.array(stan_data["rh_intra"]),
+        "light_inter":   jnp.array(stan_data["light_inter"]),
+        "light_intra":   jnp.array(stan_data["light_intra"]),
     }
-    
+   
     nuts_kernel = NUTS(model, target_accept_prob=0.92, init_strategy=init_to_median, max_tree_depth=10)
     
     mcmc = MCMC(

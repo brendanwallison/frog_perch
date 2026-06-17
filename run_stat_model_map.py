@@ -55,6 +55,7 @@ def main():
     # --- Path Resolution from Config ---
     csv_dir = Path(cfg["csv_dir"])
     rain_path = Path(cfg["rain_csv"])
+    climate_path = Path(cfg["climate_csv"])  # 🌟 Added: Parse climate file path
     calibration_json_path = Path(cfg["calibration_json_path"])
     
     # Setup safe execution directory
@@ -69,28 +70,32 @@ def main():
     
     print(f"🌧️ Loading rainfall data from {rain_path}...")
     df_rain = pd.read_csv(rain_path)
+
+    print(f"🌡️ Loading high-frequency climate log files from {climate_path}...")
+    df_climate = pd.read_csv(climate_path)  # 🌟 Added: Read raw climate dataframe
     
     print(f"⚙️ Loading calibration parameters from {calibration_json_path}...")
     with open(calibration_json_path, 'r') as f:
         calib_params = json.load(f)
     
-    print("🛠️ Preparing Hydrological Decay data...")
+    print("🛠️ Preparing Hydrological Decay + Climate Alignment data...")
     numpyro_data, windows_df, params = prepare_numpyro_data_hydrological(
         df_raw,
         df_rain,
+        df_climate,
         calibration_params=calib_params,
         knot_spacing_diel_min=cfg["knot_spacing_diel_min"],
         burn_in_days=cfg.get("burn_in_days", 14),
         w_fraction=cfg.get("w_fraction", 0.0167),
+        output_dir=run_dir,
     )
     
     # --- 2. Run Inference (MAP Optimization) ---
     print("🔥 Starting Optimization (NumPyro - SVI/AutoDelta)...")
     svi_result, guide = compile_and_run(
         numpyro_data,
-        num_steps=cfg.get("num_steps", 2500), 
+        num_steps=cfg.get("num_steps", 5000), 
         seed=cfg.get("seed", 0),
-        use_burst=cfg.get("use_burst", 1.0)
     )
     
     # --- 3. Save Results ---
@@ -106,10 +111,15 @@ def main():
         diel_step_min=params["diel_step_min"],
         burn_in_days=params["burn_in_days"],
         precip_daily=numpyro_data["precip_daily"],
-        B_diel=numpyro_data["B_diel"],
+        knots_grid=numpyro_data["knots_grid"], 
+        temp_inter=numpyro_data["temp_inter"],
+        temp_intra=numpyro_data["temp_intra"],
+        rh_inter=numpyro_data["rh_inter"],
+        rh_intra=numpyro_data["rh_intra"],
+        light_inter=numpyro_data["light_inter"],
+        light_intra=numpyro_data["light_intra"],
         **map_params
     )
-    
     # Save auxiliary coordinate data
     df_raw.to_csv(run_dir / "merged_detector_data.csv", index=False)
     windows_df.to_csv(run_dir / "windowed_detector_data.csv", index=False)

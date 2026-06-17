@@ -18,8 +18,8 @@ output_dir: stat_results/model_final
 # MCMC Settings
 # ---------------------------------------------------------
 warmup: 250
-sampling: 5000
-chains: 4
+sampling: 250
+chains: 2
 seed: 20250101
 
 # ---------------------------------------------------------
@@ -31,8 +31,8 @@ window_length_sec: 5.0
 
 # Spline Complexity Settings
 # Smaller spacing = More knots = Higher flexibility.
-knot_spacing_diel_min: 10.0     # Knot every 10 minutes
+knot_spacing_diel_min: 30.0     # Knot every 10 minutes
 burn_in_days: 30
 
 # w_fraction: 0.0167
-w_fraction: 0.1
+w_fraction: 0.083333
