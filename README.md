@@ -26,10 +26,8 @@ We enforce a strict separation between reusable source code and experimental con
 
 * Static Config (configs/nn_config.py): Controls network dimensions, regularization, paths, and training variables.
 * Dynamic Stats (configs/normalization.yaml): Contains auto-generated statistics (mean/std for confidence weighting). These are dynamically loaded at runtime.
+* Data Normalization: Run the dataset normalization preprocessing script to compute the mean and standard deviation of call bandwidths and durations. This outputs configs/normalization.yaml.
 
-## Workflow (Incomplete)
+## Workflow
 
-1. Data Normalization: Run the dataset normalization preprocessing script to compute the mean and standard deviation of call bandwidths and durations. This outputs configs/normalization.yaml.
-2. Configure: Open configs/nn_config.py to define your paths, network size, and training dynamics.
-3. Train: Run `python main.py` from the root directory. The dataset builder streams data infinitely and groups files by their embedded timestamp to prevent data leakage across partitions.
-4. Evaluate: The pipeline saves the best model weights to checkpoints/best.keras. Performance is evaluated using Count KL Divergence, Expected Count MAE, and AUC.
+Run the NN training, calibration, and statistical modeling scripts in sequence, changing dataset locations as appropriate.
