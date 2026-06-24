@@ -1,11 +1,115 @@
+# """
+# calibrate.py
+
+# Optimizes the parameters of the Bayesian acoustic sensor model 
+# using extracted features from a validated model checkpoint run.
+# """
+# import os
+# import json
+# import numpy as np
+# import pandas as pd
+# from scipy.optimize import minimize
+
+# # Import the single source of truth
+# from frog_perch.nn_calibration.sensor_model import calculate_likelihood_vector
+
+# # --- NUMERICAL GUARDS ---
+# EPS = 1e-6
+
+# def calibration_objective(params, y_mu_norm, y_var_norm, q_k_matrix, x_interf, k_max):
+#     """Calculates the negative log-likelihood across the feature tracking dataset."""
+#     param_names = ['a0', 'a_f', 'a_i', 'alpha_v', 'b0', 'b_i', 'g0', 'g_i']
+#     p_dict = dict(zip(param_names, params))
+    
+#     total_nll = 0.0
+    
+#     for i in range(len(y_mu_norm)):
+#         log_liks = calculate_likelihood_vector(
+#             y_mu_norm[i], 
+#             y_var_norm[i], 
+#             x_interf[i], 
+#             p_dict, 
+#             k_max=k_max, 
+#             return_log_likelihoods=True
+#         )
+#         # Multiply by the ground-truth weights and subtract from NLL
+#         total_nll -= np.sum(q_k_matrix[i, :] * log_liks)
+
+#     return total_nll
+
+
+# def run_calibration(config_dict: dict, csv_path: str) -> dict | None:
+#     """
+#     Stateless external entry point to fit the sensor model parameters.
+#     Returns the fitted parameters dictionary or None if optimization fails.
+#     """
+#     if not os.path.exists(csv_path):
+#         print(f"[ERROR] Extracted calibration features CSV not found at: {csv_path}")
+#         return None
+
+#     df = pd.read_csv(csv_path)
+
+#     # Set maximum support boundary dynamically from the run configuration
+#     k_max = float(config_dict.get("MAX_BIN", 8))
+
+#     # 2. Scale Covariates and Observed Intensities
+#     x_raw = df['log_mean_rms_1000_1500'].values
+#     x_mean_val = np.mean(x_raw)
+#     x_interf = x_raw - x_mean_val 
+    
+#     y_mu_norm = np.clip(df['nn_mu'].values / k_max, 0.00001, 0.99999)
+#     y_var_norm = np.clip(df['nn_var'].values / (k_max**2), 0.00001, 0.99999)
+    
+#     # Safely unpack list targets encoded as strings or native objects inside the CSV
+#     q_k_matrix = np.array([eval(q) if isinstance(q, str) else q for q in df['q_k']])
+
+#     # Layout order matches param_names layout in the objective function above
+#     init_guesses = [
+#         2.0,  0.0,  0.0,  1.0,  # a0, a_f, a_i, alpha_v (Trust parameter starts un-scaled at 1.0)
+#         -3.5, 0.1,             # b0, b_i (Noise floor parameters)
+#         1.0,  -0.1             # g0, g_i (Saturation scaling parameters)
+#     ]
+
+#     print(f"[INFO] Calibrating sensor model parameters (K_MAX={k_max})...")
+    
+#     res = minimize(
+#         calibration_objective, 
+#         init_guesses, 
+#         args=(y_mu_norm, y_var_norm, q_k_matrix, x_interf, k_max),
+#         method='L-BFGS-B',
+#         options={'maxiter': 1000, 'ftol': 1e-5}
+#     )
+
+#     if res.success:
+#         print("\n=== CALIBRATION SUCCESSFUL ===")
+#         param_names = ['a0', 'a_f', 'a_i', 'alpha_v', 'b0', 'b_i', 'g0', 'g_i']
+#         fitted_params = dict(zip(param_names, res.x))
+#         fitted_params['x_interf_center_mean'] = float(x_mean_val)
+#         fitted_params['K_MAX'] = k_max
+
+#         # Save calibration profile locally alongside the dataset checkpoint outputs
+#         out_json_path = csv_path.replace(".csv", "_calibrated_v2.json")
+#         with open(out_json_path, 'w') as f:
+#             json.dump(fitted_params, f, indent=4)
+            
+#         print(f"Fitted trust parameter (alpha_v): {fitted_params['alpha_v']:.4f}")
+#         print(f"Saved parameters to: {out_json_path}")
+#         return fitted_params
+#     else:
+#         print(f"[ERROR] Optimization failed: {res.message}")
+#         return None
+
 """
 calibrate.py
 
-Optimizes the parameters of the Bayesian acoustic sensor model 
+Optimizes the parameters of the Bayesian acoustic sensor model
 using extracted features from a validated model checkpoint run.
 """
+
 import os
 import json
+import ast
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -13,94 +117,208 @@ from scipy.optimize import minimize
 # Import the single source of truth
 from frog_perch.nn_calibration.sensor_model import calculate_likelihood_vector
 
-# --- NUMERICAL GUARDS ---
+# ---------------------------------------------------------------------
+# Numerical guard
+# ---------------------------------------------------------------------
+
 EPS = 1e-6
 
-def calibration_objective(params, y_mu_norm, nu_obs, q_k_matrix, x_interf, k_max):
-    """Calculates the negative log-likelihood across the feature tracking dataset."""
-    # REVISED: Updated to match the 8-parameter specification from the formal latex document
-    param_names = ['a0', 'a_f', 'a_i', 'alpha_v', 'b0', 'b_i', 'g0', 'g_i']
+
+# ---------------------------------------------------------------------
+# Objective
+# ---------------------------------------------------------------------
+
+def calibration_objective(
+    params,
+    y_mu_norm,
+    y_var_norm,
+    q_k_matrix,
+    x_interf,
+    k_max,
+):
+    """
+    Negative expected log-likelihood over the calibration dataset.
+    """
+
+    param_names = [
+        "a0",
+        "a_f",
+        "a_i",
+        "alpha_v",
+        "b0",
+        "b_i",
+        "g0",
+        "g_i",
+        "h0",          # NEW: log-Weibull shape parameter
+    ]
+
     p_dict = dict(zip(param_names, params))
-    
+
     total_nll = 0.0
-    
-    # Scale normalized intensities [0, 1] back up to the current grid's maximum support
-    y_raw_array = y_mu_norm * k_max
-    
+
     for i in range(len(y_mu_norm)):
+
         log_liks = calculate_likelihood_vector(
-            y_raw_array[i], 
-            nu_obs[i], 
-            x_interf[i], 
-            p_dict, 
-            k_max=k_max, 
-            return_log_likelihoods=True
+            y_mu_norm[i],
+            y_var_norm[i],
+            x_interf[i],
+            p_dict,
+            k_max=k_max,
+            return_log_likelihoods=True,
         )
-        # Multiply by the ground-truth weights and subtract from NLL
-        total_nll -= np.sum(q_k_matrix[i, :] * log_liks)
+
+        total_nll -= np.sum(
+            q_k_matrix[i] * log_liks
+        )
 
     return total_nll
 
 
-def run_calibration(config_dict: dict, csv_path: str) -> dict | None:
+# ---------------------------------------------------------------------
+# External entry point
+# ---------------------------------------------------------------------
+
+def run_calibration(
+    config_dict: dict,
+    csv_path: str,
+) -> dict | None:
     """
-    Stateless external entry point to fit the sensor model parameters.
-    Returns the fitted parameters dictionary or None if optimization fails.
+    Fits the sensor calibration model using point optimization.
     """
+
     if not os.path.exists(csv_path):
-        print(f"[ERROR] Extracted calibration features CSV not found at: {csv_path}")
+        print(f"[ERROR] Extracted calibration CSV not found:\n{csv_path}")
         return None
 
     df = pd.read_csv(csv_path)
 
-    # Set maximum support boundary dynamically from the run configuration
+    # -------------------------------------------------------------
+    # Maximum support
+    # -------------------------------------------------------------
+
     k_max = float(config_dict.get("MAX_BIN", 8))
 
-    # 2. Scale Covariates and Observed Intensities
-    x_raw = df['log_mean_rms_1000_1500'].values
+    # -------------------------------------------------------------
+    # Center interference covariate
+    # -------------------------------------------------------------
+
+    x_raw = df["log_mean_rms_1000_1500"].values
     x_mean_val = np.mean(x_raw)
-    x_interf = x_raw - x_mean_val 
-    
-    y_mu_norm = np.clip(df['nn_mu'].values / k_max, 0.001, 0.999)
-    norm_factor = (y_mu_norm * (1 - y_mu_norm))
-    nu_obs = np.clip((df['nn_var'].values / (k_max**2)) / (norm_factor + EPS), 0.01, 0.99)
-    
-    # Safely unpack list targets encoded as strings or native objects inside the CSV
-    q_k_matrix = np.array([eval(q) if isinstance(q, str) else q for q in df['q_k']])
+    x_interf = x_raw - x_mean_val
 
-    # 3. REVISED: Initial guesses matching your 8 parameters 1-to-1
-    # Layout order matches param_names layout in the objective function above
-    init_guesses = [
-        2.0,  0.0,  0.0,  1.0,  # a0, a_f, a_i, alpha_v (Trust parameter starts un-scaled at 1.0)
-        -3.5, 0.1,             # b0, b_i (Noise floor parameters)
-        1.0,  -0.1             # g0, g_i (Saturation scaling parameters)
-    ]
+    # -------------------------------------------------------------
+    # Normalize NN summaries
+    # -------------------------------------------------------------
 
-    print(f"[INFO] Calibrating sensor model parameters (K_MAX={k_max})...")
-    
-    res = minimize(
-        calibration_objective, 
-        init_guesses, 
-        args=(y_mu_norm, nu_obs, q_k_matrix, x_interf, k_max),
-        method='L-BFGS-B',
-        options={'maxiter': 1000, 'ftol': 1e-5}
+    y_mu_norm = np.clip(
+        df["nn_mu"].values / k_max,
+        1e-5,
+        1.0 - 1e-5,
     )
 
-    if res.success:
-        print("\n=== CALIBRATION SUCCESSFUL ===")
-        param_names = ['a0', 'a_f', 'a_i', 'alpha_v', 'b0', 'b_i', 'g0', 'g_i']
-        fitted_params = dict(zip(param_names, res.x))
-        fitted_params['x_interf_center_mean'] = float(x_mean_val)
-        fitted_params['K_MAX'] = k_max
+    y_var_norm = np.clip(
+        df["nn_var"].values / (k_max ** 2),
+        1e-5,
+        1.0 - 1e-5,
+    )
 
-        # Save calibration profile locally alongside the dataset checkpoint outputs
-        out_json_path = csv_path.replace(".csv", "_calibrated_v2.json")
-        with open(out_json_path, 'w') as f:
-            json.dump(fitted_params, f, indent=4)
-            
-        print(f"Fitted trust parameter (alpha_v): {fitted_params['alpha_v']:.4f}")
-        print(f"Saved parameters to: {out_json_path}")
-        return fitted_params
-    else:
+    # -------------------------------------------------------------
+    # Soft target distributions
+    # -------------------------------------------------------------
+
+    q_k_matrix = np.array([
+        ast.literal_eval(q) if isinstance(q, str) else q
+        for q in df["q_k"]
+    ])
+
+    # -------------------------------------------------------------
+    # Initial parameter guesses
+    # -------------------------------------------------------------
+
+    init_guesses = [
+
+        # Precision channel
+        2.0,      # a0
+        0.0,      # a_f
+        0.0,      # a_i
+        1.0,      # alpha_v
+
+        # Noise floor
+        -3.5,     # b0
+        0.1,      # b_i
+
+        # Saturation scale
+        1.0,      # g0
+        -0.1,     # g_i
+
+        # NEW:
+        # log(shape)
+        #
+        # h0 = 0
+        # -> shape = exp(0)=1
+        # -> exponential saturation
+        #
+        0.0,
+    ]
+
+    print(f"[INFO] Calibrating sensor model (K_MAX={k_max})...")
+
+    res = minimize(
+        calibration_objective,
+        init_guesses,
+        args=(
+            y_mu_norm,
+            y_var_norm,
+            q_k_matrix,
+            x_interf,
+            k_max,
+        ),
+        method="L-BFGS-B",
+        options={
+            "maxiter": 1000,
+            "ftol": 1e-5,
+        },
+    )
+
+    if not res.success:
         print(f"[ERROR] Optimization failed: {res.message}")
         return None
+
+    # -------------------------------------------------------------
+    # Save fitted parameters
+    # -------------------------------------------------------------
+
+    print("\n=== CALIBRATION SUCCESSFUL ===")
+
+    param_names = [
+        "a0",
+        "a_f",
+        "a_i",
+        "alpha_v",
+        "b0",
+        "b_i",
+        "g0",
+        "g_i",
+        "h0",
+    ]
+
+    fitted_params = dict(zip(param_names, res.x))
+
+    fitted_params["x_interf_center_mean"] = float(x_mean_val)
+    fitted_params["K_MAX"] = float(k_max)
+
+    out_json_path = csv_path.replace(
+        ".csv",
+        "_calibrated_v2.json",
+    )
+
+    with open(out_json_path, "w") as f:
+        json.dump(fitted_params, f, indent=4)
+
+    print(f"Final NLL:        {res.fun:.4f}")
+    print(f"alpha_v:          {fitted_params['alpha_v']:.4f}")
+    print(f"Weibull shape η:  {np.exp(fitted_params['h0']):.4f}")
+    print(f"log(shape) h0:    {fitted_params['h0']:.4f}")
+    print(f"Saved parameters: {out_json_path}")
+
+    return fitted_params

@@ -22,7 +22,7 @@ dependencies = [
     "keras>=3.14.1",
     "interpax[cuda13-pip]==0.3.14",
     "numpyro[cuda13-pip]>=0.20.0",
-    "jax[cuda13-pip]>=0.4.38",
+    "jax[cuda13,cuda13-pip]>=0.4.38",
     "jaxlib[cuda13-pip]>=0.4.38",
     "equinox>=0.11.11",
     "arviz>=1.2.0",
@@ -46,3 +46,6 @@ dev-dependencies = [
     "ruff",
     "black",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]

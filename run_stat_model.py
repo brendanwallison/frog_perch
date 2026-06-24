@@ -2,6 +2,8 @@
 """
 Pipeline runner script for call-intensity hydrological lag model.
 """
+from __future__ import annotations
+
 import argparse
 import shutil
 from pathlib import Path
@@ -49,7 +51,6 @@ def main():
     )
     
     print("🔥 Starting Parallel NUTS Chains (NumPyro Baseline Model)...")
-    # Explicitly mapped to match your MCMC compile_and_run definition parameters
     mcmc = compile_and_run(
         stan_data=numpyro_data,
         num_warmup=int(cfg["warmup"]),
@@ -62,15 +63,10 @@ def main():
     idata = az.from_numpyro(
         mcmc,
         constant_data={
-            "w_obs": numpyro_data["w_obs"], 
+            "w_obs": numpyro_data["w_obs"],
             "precip_daily": numpyro_data["precip_daily"],
-            # 🌟 Sourced exactly from the decoupled prep dictionary
-            "temp_inter": numpyro_data["temp_inter"],
-            "temp_intra": numpyro_data["temp_intra"],
-            "rh_inter": numpyro_data["rh_inter"],
-            "rh_intra": numpyro_data["rh_intra"],
-            "light_inter": numpyro_data["light_inter"],
-            "light_intra": numpyro_data["light_intra"],
+            "temp": numpyro_data["temp"],
+            "rh": numpyro_data["rh"],
             "rms_obs": numpyro_data["rms_obs"]
         },
         dims={
@@ -86,41 +82,49 @@ def main():
     
     windows_df.to_csv(output_dir / "windowed_detector_data.csv", index=False)
     
-    # 🌟 Removed B_diel and updated to save the dynamic basis parameters
     np.savez(
-        output_dir / "model_params.npz", 
+        output_dir / "model_params.npz",
         burn_in_days=params["burn_in_days"],
-        precip_daily=numpyro_data["precip_daily"], 
-        knots_grid=numpyro_data["knots_grid"], 
+        precip_daily=numpyro_data["precip_daily"],
+        knots_grid=numpyro_data["knots_grid"],
         time_of_day=numpyro_data["time_of_day"],
-        temp_inter=numpyro_data["temp_inter"],
-        temp_intra=numpyro_data["temp_intra"],
-        rh_inter=numpyro_data["rh_inter"],
-        rh_intra=numpyro_data["rh_intra"],
-        light_inter=numpyro_data["light_inter"],
-        light_intra=numpyro_data["light_intra"],
+        temp=numpyro_data["temp"],
+        rh=numpyro_data["rh"],
         rms_obs=numpyro_data["rms_obs"]
     )
-    
+        
     # --- Aligned ArviZ Summary Variable Target Block ---
     print("\n=== Parameter Convergence & Summary ===")
     vars_to_summary = [
-        "beta_0", "phi", "b_p0", "b_p1", "b_p2", 
-        "half_life_slow_val", "tau_pool_val", "b_shape_val",
-        "gamma_plateau_val", "b_rms_val",
-        "b_temp_inter_val", "b_temp_intra_val", 
-        "b_rh_inter_val", "b_rh_intra_val", 
-        "b_light_inter_val", "b_light_intra_val",
-        "sigma_diel", "b_day_val", "delta_seasonal_val"
+        "beta_0",
+        "phi",
+        "b_p0",
+        "b_p1",
+        "b_p2",
+        "half_life_slow_val",
+        "tau_pool",
+        "b_shape",
+        "gamma_plateau",
+        "b_rms_val",
+
+        "b_temp_val",
+        "b_rh_val",
+
+        "sigma_diel",
+        "b_day_val",
+        "delta_seasonal_val",
     ]
     
-    # Guard against missing keys if you drop interaction terms
-    available_vars = [v for v in vars_to_summary if v in idata.posterior]
-    
+    available_vars = [
+        v for v in vars_to_summary
+        if hasattr(idata, "posterior") and v in idata.posterior.data_vars
+    ]
+        
     summary_df = az.summary(idata, var_names=available_vars)
     print(summary_df)
     
-    max_rhat = summary_df["r_hat"].max()
+    # 🌟 FIX: Force cast the pandas series extraction to a float
+    max_rhat = float(summary_df["r_hat"].max())
     print(f"\n📈 Maximum R-hat value across core tracking blocks: {max_rhat:.4f}")
     if max_rhat > 1.05:
         print("⚠️ WARNING: High R-hat detected. Chains may not have mixed completely.")

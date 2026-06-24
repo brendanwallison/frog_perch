@@ -17,8 +17,8 @@ output_dir: stat_results/model_final
 # ---------------------------------------------------------
 # MCMC Settings
 # ---------------------------------------------------------
-warmup: 250
-sampling: 250
+warmup: 150
+sampling: 500
 chains: 2
 seed: 20250101
 

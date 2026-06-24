@@ -53,3 +53,113 @@ def build_feature_record(audio_window, sr, preds_dict_idx):
     }
     record.update(band_feats)
     return record
+
+import numpy as np
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    pos = x >= 0
+    out = np.empty_like(x, dtype=float)
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    out[~pos] = np.exp(x[~pos]) / (1.0 + np.exp(x[~pos]))
+    return out
+
+def _flatten_if_needed(x):
+    if x is None:
+        return None
+    a = np.asarray(x)
+    if a.ndim == 0:
+        return a.reshape(-1)
+    if a.ndim > 1:
+        # If shape is (batch, n_slices, 1) or (1, n_slices), flatten to (n_slices,)
+        if a.shape[0] == 1:
+            a = a[0]
+        a = a.reshape(-1)
+    return a
+
+def decode_nn_outputs(preds_dict):
+    """
+    Decode model/inspection outputs into a consistent dictionary.
+
+    Returns keys:
+      - slice_logits: 1D numpy array (length n_slices) of slice-branch logits
+      - slice_probs:  1D numpy array (length n_slices) of slice-branch probabilities
+      - count_slice_probs: 1D numpy array (length n_slices) of per-slice probs from count branch (optional)
+      - count_probs: 1D numpy array (length max_bin+1) aggregated PMF over counts
+      - binary_prob: float or None
+      - n_slices: int
+      - max_bin: int
+    """
+    # Accept preds_dict that may be a dict-like mapping or an object with keys
+    if not isinstance(preds_dict, dict):
+        raise KeyError(f"decode_nn_outputs expects a dict-like preds_dict; got {type(preds_dict)}")
+
+    # -----------------------------
+    # SLICE logits / probs
+    # -----------------------------
+    slice_logits = None
+    # Prefer explicit 'slice' (training callback used preds['slice'] as flattened logits)
+    if "slice" in preds_dict and preds_dict["slice"] is not None:
+        slice_logits = _flatten_if_needed(preds_dict["slice"])
+    # Fallback to 'slice_logits' if present
+    elif "slice_logits" in preds_dict and preds_dict["slice_logits"] is not None:
+        slice_logits = _flatten_if_needed(preds_dict["slice_logits"])
+    else:
+        raise KeyError(f"Missing slice output. Available keys: {list(preds_dict.keys())}")
+
+    # -----------------------------
+    # COUNT aggregated PMF
+    # -----------------------------
+    if "count_probs" not in preds_dict or preds_dict["count_probs"] is None:
+        raise KeyError(f"Missing 'count_probs'. Available keys: {list(preds_dict.keys())}")
+    count_probs = _flatten_if_needed(preds_dict["count_probs"])
+
+    # -----------------------------
+    # OPTIONAL: per-slice count probs (from count branch before aggregation)
+    # -----------------------------
+    count_slice_probs = None
+    if "count_slice_probs" in preds_dict and preds_dict["count_slice_probs"] is not None:
+        # This is expected to already be probabilities (sigmoid applied in model)
+        count_slice_probs = _flatten_if_needed(preds_dict["count_slice_probs"])
+        # If values look like logits (outside [0,1]) convert to probs defensively
+        if np.any(count_slice_probs < 0) or np.any(count_slice_probs > 1):
+            count_slice_probs = _sigmoid(count_slice_probs)
+
+    # -----------------------------
+    # OPTIONAL: binary
+    # -----------------------------
+    binary_prob = preds_dict.get("binary", None)
+    if binary_prob is not None:
+        bp = np.asarray(binary_prob)
+        if bp.ndim > 0:
+            try:
+                binary_prob = float(bp.reshape(-1)[0])
+            except Exception:
+                binary_prob = None
+        else:
+            try:
+                binary_prob = float(bp)
+            except Exception:
+                binary_prob = None
+
+    # -----------------------------
+    # Derive slice_probs from slice_logits (sigmoid)
+    # -----------------------------
+    slice_logits = np.asarray(slice_logits, dtype=float)
+    slice_probs = _sigmoid(slice_logits)
+
+    # -----------------------------
+    # Metadata
+    # -----------------------------
+    n_slices = int(slice_logits.shape[0])
+    max_bin = int(count_probs.shape[-1] - 1)
+
+    return {
+        "slice_logits": slice_logits,
+        "slice_probs": slice_probs,
+        "count_slice_probs": count_slice_probs,
+        "count_probs": count_probs,
+        "binary_prob": binary_prob,
+        "n_slices": n_slices,
+        "max_bin": max_bin,
+    }

@@ -2,9 +2,10 @@
 """
 Memory-Safe, High-Performance Visualization for the Clean 3-Day Linear Lag Matrix Model.
 Universal source of truth for structural cross-scale decomposition and temporal alignment.
-Updated for Dynamic B-Splines and Decoupled Inter/Intra Micro-Climate Architecture.
+Updated for Dynamic B-Splines and Unified, Continuous Global Climate Architecture.
 """
 
+from __future__ import annotations
 import argparse
 from pathlib import Path
 import numpy as np
@@ -20,7 +21,7 @@ plt.style.use("ggplot")
 # Spline Reconstruction Utility
 # ============================================================
 
-def jax_b3_spline_basis(x, knots, low_bound=17.0, up_bound=23.0):
+def jax_b3_spline_basis(x, knots, low_bound=16.0, up_bound=24.0):
     """Reconstructs the clamped basis matrix dynamically for visualization."""
     all_knots = jnp.concatenate([
         jnp.repeat(low_bound, 4), 
@@ -98,7 +99,14 @@ def iterate_draws(idata):
     post = idata.posterior
     for c in range(post.sizes["chain"]):
         for d in range(post.sizes["draw"]):
-            yield {k: post[k].values[c, d] for k in post.data_vars}
+            return_dict = {}
+            for k in post.data_vars:
+                # Force extract deterministic tracked values if they exist
+                if f"{k}_val" in post.data_vars:
+                    return_dict[k] = post[f"{k}_val"].values[c, d]
+                else:
+                    return_dict[k] = post[k].values[c, d]
+            yield return_dict
 
 def get_all_decompositions(idata, viz_meta, B_diel, m_params):
     post = idata.posterior
@@ -106,13 +114,8 @@ def get_all_decompositions(idata, viz_meta, B_diel, m_params):
     precip_daily = m_params["precip_daily"]
     n_days = len(precip_daily)
     
-    temp_inter = m_params["temp_inter"]
-    temp_intra = m_params["temp_intra"]
-    rh_inter = m_params["rh_inter"]
-    rh_intra = m_params["rh_intra"]
-    light_inter = m_params["light_inter"]
-    light_intra = m_params["light_intra"]
-    
+    temp = m_params["temp"]
+    rh = m_params["rh"]
     rms_obs = m_params.get("rms_obs", idata.constant_data["rms_obs"].values if "rms_obs" in idata.constant_data else None)
     
     day_idx = viz_meta["day_idx"]
@@ -124,7 +127,7 @@ def get_all_decompositions(idata, viz_meta, B_diel, m_params):
         "eff_interact": np.zeros((n_draws, n_days)),
         "alpha_day": np.zeros((n_draws, n_days)),
         "diel_peak_val": np.zeros(n_draws), 
-        "eff_climate_5s": np.zeros((n_draws, len(temp_inter)))
+        "eff_climate_5s": np.zeros((n_draws, len(temp)))
     }
 
     p0 = precip_daily
@@ -140,30 +143,24 @@ def get_all_decompositions(idata, viz_meta, B_diel, m_params):
         fast_rain = (b_p0 * p0) + (b_p1 * p1) + (b_p2 * p2)
         decomp["fast_rain_raw"][i] = fast_rain
 
-        ws = reconstruct_slow_wetness(precip_daily, draw.get("half_life_slow_val", draw.get("half_life_slow")))
-        tau = draw.get("tau_pool_val", draw.get("tau_pool"))
-        b_shape = draw.get("b_shape_val", draw.get("b_shape"))
+        ws = reconstruct_slow_wetness(precip_daily, draw["half_life_slow"])
+        tau = draw["tau_pool"]
+        b_shape = draw["b_shape"]
         trigger = 1.0 / (1.0 + np.exp(-b_shape * (ws - tau)))
         
-        gamma_plateau = draw.get("gamma_plateau_val", draw.get("gamma_plateau"))
+        gamma_plateau = draw["gamma_plateau"]
         decomp["eff_slow_raw"][i] = gamma_plateau * trigger
+        decomp["eff_interact"][i] = 0.0 # Interaction terms safely zeroed out for simpler graph
         
-        b_fast_slow = draw.get("b_fast_slow", 0.0) 
-        decomp["eff_interact"][i] = b_fast_slow * np.tanh(fast_rain) * trigger
-        
-        decomp["alpha_day"][i] = draw["alpha_day_raw"] * draw.get("b_day_val", draw.get("b_day"))
+        decomp["alpha_day"][i] = draw["alpha_day_raw"] * draw["b_day"]
         decomp["beta_0"][i] = draw["beta_0"]
         
         beta_diel = np.concatenate([[0.0], np.cumsum(draw["z_diel_raw"] * draw["sigma_diel"])])
         decomp["diel_peak_val"][i] = np.max(B_diel @ beta_diel)
 
         decomp["eff_climate_5s"][i] = (
-            (draw["b_temp_inter"] * temp_inter) + 
-            (draw["b_temp_intra"] * temp_intra) + 
-            (draw["b_rh_inter"] * rh_inter) + 
-            (draw["b_rh_intra"] * rh_intra) + 
-            (draw["b_light_inter"] * light_inter) + 
-            (draw["b_light_intra"] * light_intra) + 
+            (draw["b_temp"] * temp) + 
+            (draw["b_rh"] * rh) + 
             (draw["b_rms"] * rms_obs)
         )
 
@@ -183,14 +180,13 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
     diel = decomp["diel_peak_val"][:, None]
     fast = decomp["fast_rain_raw"]
     slow = decomp["eff_slow_raw"]
-    interact = decomp["eff_interact"]
     alpha = decomp["alpha_day"]
     
     base_scalars = b0 + diel
     stack_base = np.broadcast_to(base_scalars, (base_scalars.shape[0], n_days))
     
     stack_with_slow = stack_base + slow
-    stack_with_weather = stack_with_slow + fast + interact
+    stack_with_weather = stack_with_slow + fast
     stack_total = stack_with_weather + alpha
     
     def get_stats(stack_matrix):
@@ -216,7 +212,7 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
     plt.fill_between(days, lo_tot, hi_tot, color="purple", alpha=0.12, label="Alpha Day Unmodeled Bounds", zorder=1)
 
     plt.axhline(0, color='black', linestyle='--', alpha=0.3)
-    plt.title("Log-Intensity Timeline Decomposition (Cumulative Macro-Scale Stack)", fontsize=14, pad=15)
+    plt.title("Log-Intensity Timeline Decomposition (Cumulative Unified Model Stack)", fontsize=14, pad=15)
     plt.ylabel("Cumulative Log-scale Contribution", fontsize=12)
     plt.legend(loc='upper left', bbox_to_anchor=(1, 1), facecolor="white", framealpha=0.9)
     plt.xticks(rotation=45)
@@ -227,8 +223,7 @@ def plot_additive_component_synthesis(decomp, viz_meta, output_dir):
 def plot_seasonal_intensity_at_diel_peak_abs(decomp, viz_meta, output_dir):
     days = viz_meta["full_calendar"]
     total_log = (decomp["beta_0"][:, None] + decomp["fast_rain_raw"] + 
-                 decomp["eff_slow_raw"] + decomp["eff_interact"] + 
-                 decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
+                 decomp["eff_slow_raw"] + decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
     
     log_offset = np.log(60.0 / 5.0) 
     log_rate = log_offset + total_log
@@ -247,8 +242,7 @@ def plot_seasonal_intensity_at_diel_peak_abs(decomp, viz_meta, output_dir):
 def plot_seasonal_intensity_at_diel_peak(decomp, viz_meta, output_dir):
     days = viz_meta["full_calendar"]
     total_log = (decomp["beta_0"][:, None] + decomp["fast_rain_raw"] + 
-                 decomp["eff_slow_raw"] + decomp["eff_interact"] + 
-                 decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
+                 decomp["eff_slow_raw"] + decomp["alpha_day"] + decomp["diel_peak_val"][:, None])
     
     log_offset = np.log(60.0 / 5.0) 
     log_rate = log_offset + total_log
@@ -270,7 +264,7 @@ def plot_absolute_scale_multipliers(decomp, viz_meta, output_dir):
     
     plt.figure(figsize=(15, 8), dpi=150)
     mult_slow = np.exp(decomp["eff_slow_raw"])
-    mult_fast = np.exp(decomp["fast_rain_raw"] + decomp["eff_interact"])
+    mult_fast = np.exp(decomp["fast_rain_raw"])
     mult_alpha = np.exp(decomp["alpha_day"])
     
     def get_mult_stats(matrix):
@@ -336,9 +330,9 @@ def plot_structural_hydrology_and_lags(idata, precip_daily, output_dir):
     
     trigger_l = []
     for d in iterate_draws(idata):
-        ws = reconstruct_slow_wetness(precip_daily, get_param(d, "half_life_slow"))
-        tau = get_param(d, "tau_pool")
-        b_shape = get_param(d, "b_shape")
+        ws = reconstruct_slow_wetness(precip_daily, d["half_life_slow"])
+        tau = d["tau_pool"]
+        b_shape = d["b_shape"]
         trigger = 1.0 / (1.0 + np.exp(-b_shape * (ws - tau)))
         trigger_l.append(trigger)
     
@@ -376,13 +370,11 @@ def plot_total_rain_influence(idata, viz_meta, precip_daily, output_dir):
     p2 = np.concatenate([[0.0, 0.0], precip_daily[:-2]])
     
     for draw in iterate_draws(idata):
-        fast_rain = (get_param(draw, "b_p0") * p0) + (get_param(draw, "b_p1") * p1) + (get_param(draw, "b_p2") * p2)
-        ws = reconstruct_slow_wetness(precip_daily, get_param(draw, "half_life_slow"))
-        trigger = 1.0 / (1.0 + np.exp(-get_param(draw, "b_shape") * (ws - get_param(draw, "tau_pool"))))
-        
-        r_s = get_param(draw, "gamma_plateau") * trigger
-        r_interact = get_param(draw, "b_fast_slow") * np.tanh(fast_rain) * trigger if "b_fast_slow" in draw else 0.0
-        all_t.append(fast_rain + r_s + r_interact)
+        fast_rain = (draw["b_p0"] * p0) + (draw["b_p1"] * p1) + (draw["b_p2"] * p2)
+        ws = reconstruct_slow_wetness(precip_daily, draw["half_life_slow"])
+        trigger = 1.0 / (1.0 + np.exp(-draw["b_shape"] * (ws - draw["tau_pool"])))
+        r_s = draw["gamma_plateau"] * trigger
+        all_t.append(fast_rain + r_s)
         
     mu, lo, hi = np.mean(all_t, 0), np.percentile(all_t, 2.5, 0), np.percentile(all_t, 97.5, 0)
     plt.figure(figsize=(14, 6)); plt.plot(viz_meta["full_calendar"], mu, color='dodgerblue')
@@ -396,13 +388,11 @@ def plot_mcmc_health(idata, output_dir):
         "beta_0", "phi", "b_p0", "b_p1", "b_p2", 
         "half_life_slow_val", "tau_pool_val", "b_shape_val",
         "gamma_plateau_val", "b_rms_val",
-        "b_temp_inter_val", "b_temp_intra_val", 
-        "b_rh_inter_val", "b_rh_intra_val", 
-        "b_light_inter_val", "b_light_intra_val",
+        "b_temp_val", "b_rh_val", 
         "sigma_diel", "b_day_val", "delta_seasonal_val"
     ]
     
-    plot_vars = [v for v in priority_vars if v in idata.posterior.data_vars]
+    plot_vars = [v for v in priority_vars if v in idata.posterior.data_vars or f"{v}_val" in idata.posterior.data_vars]
     
     print("📊 Generating MCMC health rank plots for core parameters...")
     az.plot_rank(idata, var_names=plot_vars)
@@ -414,31 +404,27 @@ def plot_mcmc_health(idata, output_dir):
     az.summary(idata, var_names=all_vars).to_csv(Path(output_dir) / "mcmc_summary.csv")
 
 def plot_microclimate_marginals(idata, output_dir):
+    """Plots the unified, single-scale posterior slopes for the continuous model."""
     from scipy.stats import gaussian_kde
     
-    plt.figure(figsize=(14, 8), dpi=150)
+    plt.figure(figsize=(12, 6), dpi=150)
     post = idata.posterior
     
     climate_vars = {
-        r"Temp Inter-Day ($b_{temp\_inter}$)": post["b_temp_inter"].values.flatten(),
-        r"Temp Intra-Day ($b_{temp\_intra}$)": post["b_temp_intra"].values.flatten(),
-        r"RH Inter-Day ($b_{rh\_inter}$)": post["b_rh_inter"].values.flatten(),
-        r"RH Intra-Day ($b_{rh\_intra}$)": post["b_rh_intra"].values.flatten(),
-        r"Light Inter-Day ($b_{light\_inter}$)": post["b_light_inter"].values.flatten() if "b_light_inter" in post else None,
-        r"Light Intra-Day ($b_{light\_intra}$)": post["b_light_intra"].values.flatten(),
+        r"Global Temperature ($b_{temp}$)": post["b_temp"].values.flatten(),
+        r"Global Relative Humidity ($b_{rh}$)": post["b_rh"].values.flatten(),
         r"Acoustic Noise Suppression ($b_{rms}$)": post["b_rms"].values.flatten()
     }
     
-    colors = ["#e74c3c", "#c0392b", "#3498db", "#2980b9", "#f1c40f", "#f39c12", "#2c3e50"]
+    colors = ["#e74c3c", "#3498db", "#2c3e50"]
     for (name, chain_draws), color in zip(climate_vars.items(), colors):
-        if chain_draws is not None:
-            kde = gaussian_kde(chain_draws)
-            x_eval = np.linspace(chain_draws.min() - chain_draws.std(), chain_draws.max() + chain_draws.std(), 200)
-            plt.plot(x_eval, kde(x_eval), label=name, color=color, lw=2)
+        kde = gaussian_kde(chain_draws)
+        x_eval = np.linspace(chain_draws.min() - chain_draws.std(), chain_draws.max() + chain_draws.std(), 200)
+        plt.plot(x_eval, kde(x_eval), label=name, color=color, lw=2)
         
     plt.axvline(0.0, color='black', linestyle='--', alpha=0.6)
-    plt.title("High-Frequency Sub-Daily Kinetic Parameter Posteriors (Decoupled)", fontsize=13, pad=15)
-    plt.xlabel("Standardized Coordinate Log-scale Effect Size", fontsize=11)
+    plt.title("Unified Single-Scale Environmental Posterior Slopes", fontsize=13, pad=15)
+    plt.xlabel("Standardized Log-scale Effect Size (β)", fontsize=11)
     plt.ylabel("Posterior Density", fontsize=11)
     plt.legend(facecolor="white", framealpha=0.9, loc="upper right")
     plt.tight_layout()
@@ -456,7 +442,7 @@ def plot_multiscale_phase_portrait(decomp, idata, viz_meta, output_dir):
     
     total_log_rate = np.nanmedian(
         decomp["beta_0"][:, None] + decomp["eff_climate_5s"] + 
-        (decomp["fast_rain_raw"] + decomp["eff_slow_raw"] + decomp["eff_interact"])[:, day_idx] + 
+        (decomp["fast_rain_raw"] + decomp["eff_slow_raw"])[:, day_idx] + 
         decomp["alpha_day"][:, day_idx], axis=0
     )
     
@@ -473,7 +459,7 @@ def plot_multiscale_phase_portrait(decomp, idata, viz_meta, output_dir):
     cbar = plt.colorbar(sc)
     cbar.set_label("Net Expected Call Rate (Log Scale)", fontsize=11)
     
-    plt.title("Multi-scale Behavioral Phase Portrait (State-Space Coordination)", fontsize=13, pad=15)
+    plt.title("Unified Behavioral Phase Portrait (State-Space Coordination)", fontsize=13, pad=15)
     plt.xlabel("Macro-Scale Carrying Capacity Switch State (Slow Hydrology Trigger)", fontsize=11)
     plt.ylabel("High-Frequency Environmental & Noise Pressure (Sub-Daily Score)", fontsize=11)
     plt.grid(True, linestyle=":", alpha=0.5)
@@ -491,13 +477,10 @@ def plot_rainfall_marginals(idata, output_dir):
         r"Day-Of Pulse ($b_{p0}$)": post["b_p0"].values.flatten(),
         r"1-Day Lag Recovery ($b_{p1}$)": post["b_p1"].values.flatten(),
         r"2-Day Lag Recovery ($b_{p2}$)": post["b_p2"].values.flatten(),
-        r"Seasonal Plateau Amp ($\gamma_{plateau\_val}$)": post.get("gamma_plateau_val", post.get("gamma_plateau")).values.flatten()
+        r"Seasonal Plateau Amp ($\gamma_{plateau}$)": post["gamma_plateau"].values.flatten()
     }
     
-    if "b_fast_slow" in post:
-        rainfall_vars[r"Cross-Scale Gate ($b_{fast\_slow}$)"] = post["b_fast_slow"].values.flatten()
-    
-    colors = ["#2ecc71", "#27ae60", "#1abc9c", "#9b59b6", "#e67e22"]
+    colors = ["#2ecc71", "#27ae60", "#1abc9c", "#9b59b6"]
     for (name, chain_draws), color in zip(rainfall_vars.items(), colors):
         kde = gaussian_kde(chain_draws)
         x_eval = np.linspace(chain_draws.min() - chain_draws.std(), chain_draws.max() + chain_draws.std(), 200)
@@ -512,53 +495,8 @@ def plot_rainfall_marginals(idata, output_dir):
     plt.savefig(Path(output_dir) / "hydrological_process_marginals.png", dpi=150)
     plt.close()
 
-def plot_decoupled_climate_effects(idata, output_dir):
-    """Directly compares the posterior distributions of Inter vs Intra effects."""
-    from scipy.stats import gaussian_kde
-    
-    post = idata.posterior
-    pairs = [
-        ("Temperature", "b_temp_inter", "b_temp_intra"),
-        ("Relative Humidity", "b_rh_inter", "b_rh_intra")
-    ]
-    
-    if "b_light_inter" in post and "b_light_intra" in post:
-        pairs.append(("Light Attenuation", "b_light_inter", "b_light_intra"))
-        
-    fig, axes = plt.subplots(len(pairs), 1, figsize=(11, 4 * len(pairs)), dpi=150, sharex=True)
-    if len(pairs) == 1: axes = [axes]
-        
-    for ax, (name, inter_key, intra_key) in zip(axes, pairs):
-        inter_vals = post[inter_key].values.flatten()
-        intra_vals = post[intra_key].values.flatten()
-        
-        kde_inter = gaussian_kde(inter_vals)
-        kde_intra = gaussian_kde(intra_vals)
-        
-        x_min = min(inter_vals.min(), intra_vals.min())
-        x_max = max(inter_vals.max(), intra_vals.max())
-        x_pad = (x_max - x_min) * 0.2
-        x_eval = np.linspace(x_min - x_pad, x_max + x_pad, 300)
-        
-        ax.fill_between(x_eval, kde_inter(x_eval), alpha=0.4, color="#e74c3c", label=f"Macro/Inter-day ({inter_key})")
-        ax.plot(x_eval, kde_inter(x_eval), color="#c0392b", lw=2)
-        
-        ax.fill_between(x_eval, kde_intra(x_eval), alpha=0.4, color="#3498db", label=f"Micro/Intra-day ({intra_key})")
-        ax.plot(x_eval, kde_intra(x_eval), color="#2980b9", lw=2)
-        
-        ax.axvline(0.0, color="black", linestyle="--", alpha=0.6)
-        ax.set_title(f"{name} Pressure: Baseline vs. Shock", fontsize=13)
-        ax.set_ylabel("Posterior Density", fontsize=11)
-        ax.legend(loc="upper right", facecolor="white", framealpha=0.9)
-
-    axes[-1].set_xlabel("Standardized Log-scale Effect Size (β)", fontsize=12)
-    plt.suptitle("Decoupled Environmental Pressures: Macro Baseline vs. Micro Shock", fontsize=14, y=0.97)
-    plt.tight_layout()
-    plt.savefig(Path(output_dir) / "decoupled_climate_comparison.png", dpi=150)
-    plt.close()
-
 def plot_climate_timescale_decomposition(decomp, viz_meta, windows_df, output_dir):
-    """Structural Decompilation and Frequency Check on 5s Covariates."""
+    """Variance Partitioning check on unified climate predictors."""
     joint_climate_effect = np.nanmedian(decomp["eff_climate_5s"], axis=0)
     
     df_calc = pd.DataFrame({
@@ -580,9 +518,9 @@ def plot_climate_timescale_decomposition(decomp, viz_meta, windows_df, output_di
 
     sum_of_vars = var_daily + var_diel + var_resid
 
-    print("\n🧮 --- Hierarchical Climate Variance Partitioning ---")
+    print("\n🧮 --- Unified Hierarchical Variance Partitioning ---")
     print(f" Total Reconstructed Variance (Sample Sum):  {sum_of_vars:.6f}")
-    print(f" ──► Daily Macro Component Variance:         {var_daily:.6f} ({var_daily/sum_of_vars*100:.1f}%)")
+    print(f" ──► Daily Baseline Component Variance:      {var_daily:.6f} ({var_daily/sum_of_vars*100:.1f}%)")
     print(f" ──► Diel Circadian Component Variance:      {var_diel:.6f} ({var_diel/sum_of_vars*100:.1f}%)")
     print(f" ──► Window Residual Scale Variance:         {var_resid:.6f} ({var_resid/sum_of_vars*100:.1f}%)")
     print("----------------------------------------------------\n")
@@ -600,7 +538,7 @@ def plot_climate_timescale_decomposition(decomp, viz_meta, windows_df, output_di
     sorted_diel_vals = diel_profile.values[u_idx]
     sort_sort = np.argsort(u_hours)
     axes[1].plot(u_hours[sort_sort], sorted_diel_vals[sort_sort], color="#3498db", lw=2.5)
-    axes[1].set_title(f"Sub-Daily Diel Circadian Component Wave (Contribution: {var_diel/sum_of_vars*100:.1f}%)", fontsize=11)
+    axes[1].set_title(f"Sub-Daily Diel Circadian Component Component (Contribution: {var_diel/sum_of_vars*100:.1f}%)", fontsize=11)
     axes[1].set_xlabel("Time of Day (Hours)")
     axes[1].set_ylabel("Log-scale Effect Profile")
 
@@ -615,116 +553,27 @@ def plot_climate_timescale_decomposition(decomp, viz_meta, windows_df, output_di
     plt.close()
 
 # ============================================================
-# 🌟 NEW: Intraday Shock Heatmap (Dataset-Wide Fingerprint)
+# Gap-Aware Continuous Environmental Heatmaps
 # ============================================================
 
-def plot_intraday_shock_heatmap(m_params, windows_df, output_dir):
-    """Visualizes the duration and correlation of intra-day shocks across the entire dataset."""
-    
-    # 🌟 FIX: Include light_intra natively
-    df_dict = {
-        "datetime": pd.to_datetime(windows_df["start_time"]),
-        "temp_shock": m_params["temp_intra"],
-        "rh_shock": m_params["rh_intra"]
-    }
-    
-    # Safely load light if it exists in the archive
-    has_light = "light_intra" in m_params
-    if has_light:
-        df_dict["light_shock"] = m_params["light_intra"]
-        
-    df = pd.DataFrame(df_dict)
-    
-    df["date"] = df["datetime"].dt.date
-    df["time_bin"] = df["datetime"].dt.floor("5min").dt.time
-    
-    # Pivot datasets to create (Date x Time) matrices
-    temp_pivot = df.pivot_table(index="date", columns="time_bin", values="temp_shock", aggfunc="mean")
-    rh_pivot = df.pivot_table(index="date", columns="time_bin", values="rh_shock", aggfunc="mean")
-    
-    if has_light:
-        light_pivot = df.pivot_table(index="date", columns="time_bin", values="light_shock", aggfunc="mean")
-        common_cols = temp_pivot.columns.intersection(rh_pivot.columns).intersection(light_pivot.columns)
-        light_pivot = light_pivot[common_cols]
-    else:
-        common_cols = temp_pivot.columns.intersection(rh_pivot.columns)
-        
-    temp_pivot = temp_pivot[common_cols]
-    rh_pivot = rh_pivot[common_cols]
-    
-    # Expand to 3 subplots if light is present
-    n_plots = 3 if has_light else 2
-    fig, axes = plt.subplots(1, n_plots, figsize=(8 * n_plots, 10), sharey=True, dpi=150)
-    if n_plots == 2: axes = list(axes) # Ensure indexing works
-    
-    def format_heatmap(ax, pivot_df, title, cmap):
-        im = ax.imshow(pivot_df.values, aspect="auto", cmap=cmap, vmin=-3, vmax=3, interpolation="none")
-        ax.set_title(title, fontsize=13, pad=10)
-        
-        y_ticks = np.arange(0, len(pivot_df.index), max(1, len(pivot_df.index)//15))
-        ax.set_yticks(y_ticks)
-        ax.set_yticklabels([pivot_df.index[i].strftime("%b %d") for i in y_ticks])
-        
-        x_ticks = np.arange(0, len(pivot_df.columns), max(1, len(pivot_df.columns)//6))
-        ax.set_xticks(x_ticks)
-        ax.set_xticklabels([pivot_df.columns[i].strftime("%H:%M") for i in x_ticks])
-        ax.set_xlabel("Time of Day (17:00 - 23:00)", fontsize=11)
-        
-        return im
-
-    # Temperature (Red/Blue diverging)
-    im1 = format_heatmap(axes[0], temp_pivot, "Temperature Shocks (SD)", "RdBu_r")
-    fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04, label="Colder  <-- Standard Deviations -->  Hotter")
-    
-    # Relative Humidity (Brown/Green diverging)
-    im2 = format_heatmap(axes[1], rh_pivot, "Relative Humidity Shocks (SD)", "BrBG")
-    fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04, label="Drier  <-- Standard Deviations -->  Wetter")
-    
-    # Light Attenuation (Purple/Orange diverging)
-    if has_light:
-        im3 = format_heatmap(axes[2], light_pivot, "Light Attenuation Shocks (SD)", "PuOr")
-        fig.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04, label="Darker  <-- Standard Deviations -->  Brighter")
-    
-    plt.suptitle("Entire Dataset Footprint: Duration & Correlation of Micro-Climate Shocks", fontsize=15, y=0.96)
-    plt.tight_layout()
-    plt.savefig(Path(output_dir) / "intraday_shock_heatmaps.png", dpi=150)
-    plt.close()
-
 def plot_comprehensive_effect_heatmaps(idata, m_params, windows_df, decomp, viz_meta, B_diel, output_dir):
-    """Generates heatmaps translating standardized environmental drivers into true Log-Scale Effects."""
-    print("🌡️ Generating Comprehensive Effect-Scale Heatmaps...")
+    """Generates heatmaps parsing unified inputs into explicit, gap-aware log-scale parameters."""
+    print("🌡️ Generating Comprehensive Unified Effect Heatmaps...")
     post = idata.posterior
 
-    # --- 1. Extract Median Parameters ---
-    b_temp_inter = float(post["b_temp_inter"].median())
-    b_temp_intra = float(post["b_temp_intra"].median())
-    b_rh_inter = float(post["b_rh_inter"].median())
-    b_rh_intra = float(post["b_rh_intra"].median())
-    
-    has_light = "light_intra" in m_params
-    b_light_inter = float(post["b_light_inter"].median()) if has_light else 0.0
-    b_light_intra = float(post["b_light_intra"].median()) if has_light else 0.0
+    # --- 1. Extract Median Slopes ---
+    b_temp = float(post["b_temp"].median())
+    b_rh = float(post["b_rh"].median())
 
-    # --- 2. Compute Effect Vectors (X * Beta) ---
-    # Plot 1: Intraday Effects Only
-    eff_temp_intra = b_temp_intra * m_params["temp_intra"]
-    eff_rh_intra = b_rh_intra * m_params["rh_intra"]
-    eff_light_intra = b_light_intra * m_params["light_intra"] if has_light else None
+    # --- 2. Compute Effect Heatmap Inputs (X * Beta) ---
+    eff_temp = b_temp * m_params["temp"]
+    eff_rh = b_rh * m_params["rh"]
 
-    # Plot 2: Combined Effects (Macro + Micro)
-    eff_temp_comb = eff_temp_intra + (b_temp_inter * m_params["temp_inter"])
-    eff_rh_comb = eff_rh_intra + (b_rh_inter * m_params["rh_inter"])
-    eff_light_comb = eff_light_intra + (b_light_inter * m_params["light_inter"]) if has_light else None
-
-    # --- 3. Compute Total Model Log-Rate (Lambda) ---
+    # --- 3. Compute Total Unified Model Log-Rate (Lambda) ---
     b0 = float(post["beta_0"].median())
-    
-    # Compress daily vectors
     fast_rain = np.median(decomp["fast_rain_raw"], axis=0)
     slow_rain = np.median(decomp["eff_slow_raw"], axis=0)
-    interact = np.median(decomp["eff_interact"], axis=0)
-    alpha_day = np.median(decomp["alpha_day"], axis=0)
-    daily_stack = fast_rain + slow_rain + interact + alpha_day
+    daily_stack = fast_rain + slow_rain
     day_idx = viz_meta["day_idx"]
 
     # Reconstruct median biological diel curve
@@ -733,46 +582,37 @@ def plot_comprehensive_effect_heatmaps(idata, m_params, windows_df, decomp, viz_
     beta_diel_med = np.median(np.concatenate([np.zeros((*sigma_diel.shape, 1)), np.cumsum(z_diel_raw * sigma_diel[..., np.newaxis], axis=-1)], axis=-1), axis=(0,1))
     trend_diel = B_diel @ beta_diel_med
 
-    # eff_climate_5s already includes the RMS noise parameter
+    # Climate stack natively holds standard error thresholds 
     climate_stack = np.median(decomp["eff_climate_5s"], axis=0)
-
-    # The grand unifying equation
     total_log_rate = b0 + daily_stack[day_idx] + trend_diel + climate_stack
 
-    # --- 4. Build Alignment DataFrame ---
-    df_dict = {
+    # --- 4. Build Alignment Grid DataFrame ---
+    df = pd.DataFrame({
         "datetime": pd.to_datetime(windows_df["start_time"]),
-        "eff_temp_intra": eff_temp_intra,
-        "eff_rh_intra": eff_rh_intra,
-        "eff_temp_comb": eff_temp_comb,
-        "eff_rh_comb": eff_rh_comb,
+        "eff_temp": eff_temp,
+        "eff_rh": eff_rh,
         "total_log_rate": total_log_rate
-    }
-    if has_light:
-        df_dict["eff_light_intra"] = eff_light_intra
-        df_dict["eff_light_comb"] = eff_light_comb
-
-    df = pd.DataFrame(df_dict)
+    })
     df["date"] = df["datetime"].dt.date
-    df["time_bin"] = df["datetime"].dt.floor("5min").dt.time # Sub-sample to 5-minute grid
+    df["time_bin"] = df["datetime"].dt.floor("10min").dt.time 
 
-    # --- 5. Plotting Helper ---
+    # --- 5. Plotting Rendering Wrapper ---
     def draw_heatmap_row(cols, titles, cmaps, output_name, super_title, vmin=None, vmax=None):
         n_plots = len(cols)
         fig, axes = plt.subplots(1, n_plots, figsize=(8 * n_plots, 10), sharey=True, dpi=150)
         if n_plots == 1: axes = [axes]
 
         for i, (col, title, cmap) in enumerate(zip(cols, titles, cmaps)):
-            # Pivoting inherently respects the audio gaps. Missing windows become NaN.
+            # Pivoting naturally leaves audio recording gaps blank (NaN/Gray background)
             pivot = df.pivot_table(index="date", columns="time_bin", values=col, aggfunc="mean")
 
-            # Force symmetric 0-centering for effect plots, use min/max for total rate
             if vmin is None and vmax is None:
                 abs_max = np.nanmax(np.abs(pivot.values))
                 c_vmin, c_vmax = -abs_max, abs_max
             else:
                 c_vmin, c_vmax = vmin, vmax
 
+            axes[i].set_facecolor('#e0e0e0') # Gray mask for unrecorded nights
             im = axes[i].imshow(pivot.values, aspect="auto", cmap=cmap, vmin=c_vmin, vmax=c_vmax, interpolation="none")
             axes[i].set_title(title, fontsize=13, pad=10)
 
@@ -780,7 +620,7 @@ def plot_comprehensive_effect_heatmaps(idata, m_params, windows_df, decomp, viz_
             axes[i].set_yticks(y_ticks)
             axes[i].set_yticklabels([pivot.index[j].strftime("%b %d") for j in y_ticks])
 
-            x_ticks = np.arange(0, len(pivot.columns), max(1, len(pivot.columns)//6))
+            x_ticks = np.arange(0, len(pivot.columns), max(1, len(pivot.columns)//5))
             axes[i].set_xticks(x_ticks)
             axes[i].set_xticklabels([pivot.columns[j].strftime("%H:%M") for j in x_ticks])
             axes[i].set_xlabel("Time of Day (17:00 - 23:00)", fontsize=11)
@@ -796,88 +636,20 @@ def plot_comprehensive_effect_heatmaps(idata, m_params, windows_df, decomp, viz_
         plt.savefig(Path(output_dir) / output_name, dpi=150)
         plt.close()
 
-    # --- Execute Plot 1: Intraday Effects Only ---
-    cols1 = ["eff_temp_intra", "eff_rh_intra"] + (["eff_light_intra"] if has_light else [])
-    titles1 = ["Intraday Temperature Effect", "Intraday Humidity Effect"] + (["Intraday Light Effect"] if has_light else [])
-    cmaps1 = ["RdBu", "BrBG", "PuOr"][:len(cols1)] # RdBu (not reversed) so red = positive pull on call rate
-    draw_heatmap_row(cols1, titles1, cmaps1, "heatmap_effects_1_intraday.png", "Isolated Micro-Climate Effects (Intraday Shocks)")
+    # --- Render Component Heatmaps ---
+    cols1 = ["eff_temp", "eff_rh"]
+    titles1 = ["Unified Temperature Effect", "Unified Humidity Effect"]
+    cmaps1 = ["RdBu", "BrBG"]
+    
+    # Passing arguments exactly matched to the updated function signature
+    draw_heatmap_row(cols1, titles1, cmaps1, "heatmap_effects_2_combined.png", "Continuous Parameter Environmental Effects (Log-Scale Weightings)")
 
-    # --- Execute Plot 2: Combined Macro + Micro Effects ---
-    cols2 = ["eff_temp_comb", "eff_rh_comb"] + (["eff_light_comb"] if has_light else [])
-    titles2 = ["Combined Temp Effect (Macro + Micro)", "Combined RH Effect (Macro + Micro)"] + (["Combined Light Effect (Macro + Micro)"] if has_light else [])
-    draw_heatmap_row(cols2, titles2, cmaps1, "heatmap_effects_2_combined.png", "Combined Environmental Effects (Interday Baseline + Intraday Shock)")
-
-    # --- Execute Plot 3: Total Model Prediction ---
-    # Total log-rate is absolute, so we do not zero-center it. Viridis works best for sequential density.
+    # --- Render Grand Mean Output Prediction ---
     draw_heatmap_row(["total_log_rate"], ["Total Reconstructed Call Intensity"], ["viridis"], 
                      "heatmap_effects_3_total_rate.png", "Total Comprehensive Model Output (Expected Log Rate)", 
                      vmin=df["total_log_rate"].min(), vmax=df["total_log_rate"].max())
     
     print("✅ Effect heatmaps saved successfully.")
-
-def plot_specific_night_shocks(m_params, windows_df, output_dir):
-    """Plots specific case-study nights to show multi-variable shock coordination."""
-    df_dict = {
-        "datetime": pd.to_datetime(windows_df["start_time"]),
-        "temp_shock": m_params["temp_intra"],
-        "rh_shock": m_params["rh_intra"]
-    }
-    
-    has_light = "light_intra" in m_params
-    if has_light:
-        df_dict["light_shock"] = m_params["light_intra"]
-        
-    df = pd.DataFrame(df_dict)
-    df["date"] = df["datetime"].dt.date
-    
-    # Grab a few unique dates to inspect (skip the first day to avoid boundary edge effects)
-    unique_dates = df["date"].unique()
-    if len(unique_dates) < 4:
-        sample_dates = unique_dates
-    else:
-        # Pick 3 consecutive days early in the dataset
-        sample_dates = unique_dates[1:4] 
-        
-    fig, axes = plt.subplots(len(sample_dates), 1, figsize=(14, 3 * len(sample_dates)), sharex=False, dpi=150)
-    if len(sample_dates) == 1: axes = [axes]
-    
-    for ax, target_date in zip(axes, sample_dates):
-        night_df = df[df["date"] == target_date].sort_values("datetime")
-        
-        # Primary Axis: Temperature
-        ax.plot(night_df["datetime"], night_df["temp_shock"], color="#e74c3c", label="Temp Shock (SD)", lw=2)
-        ax.set_ylabel("Temp Deviation", color="#e74c3c", fontweight="bold")
-        
-        # Twin Axis 1: Relative Humidity
-        ax2 = ax.twinx()
-        ax2.plot(night_df["datetime"], night_df["rh_shock"], color="#3498db", label="RH Shock (SD)", lw=2, linestyle="--")
-        ax2.set_ylabel("RH Deviation", color="#3498db", fontweight="bold")
-        
-        # Twin Axis 2: Light (Offset to the right so it doesn't overlap RH)
-        if has_light:
-            ax3 = ax.twinx()
-            ax3.spines.right.set_position(("axes", 1.1)) # Push the 3rd axis outward
-            ax3.plot(night_df["datetime"], night_df["light_shock"], color="#9b59b6", label="Light Shock (SD)", lw=2, linestyle=":")
-            ax3.set_ylabel("Light Deviation", color="#9b59b6", fontweight="bold")
-            
-        ax.axhline(0, color="black", linestyle="-", alpha=0.3)
-        ax.set_title(f"Intra-Day Micro-Climate Shocks on {target_date}", fontsize=12)
-        
-        # Consolidate Legends
-        lines, labels = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        all_lines = lines + lines2
-        all_labels = labels + labels2
-        if has_light:
-            lines3, labels3 = ax3.get_legend_handles_labels()
-            all_lines += lines3
-            all_labels += labels3
-            
-        ax.legend(all_lines, all_labels, loc="upper right", facecolor="white", framealpha=0.9)
-        
-    plt.tight_layout()
-    plt.savefig(Path(output_dir) / "intra_shock_fingerprints.png", dpi=150)
-    plt.close()
 
 # ============================================================
 # Main Execution Loop
@@ -898,9 +670,7 @@ def main():
     m_params = np.load(args.output_dir / "model_params.npz")
     
     viz_meta = preprocess_viz_metadata(windows_df, m_params["precip_daily"], int(m_params["burn_in_days"]))
-    
     B_diel = jax_b3_spline_basis(m_params["time_of_day"], m_params["knots_grid"])
-    
     decomp = get_all_decompositions(idata, viz_meta, B_diel, m_params)
 
     print("🎨 Generating unified plot suite...")
@@ -914,17 +684,11 @@ def main():
     plot_day_random_effects(idata, viz_meta, args.output_dir)
     plot_total_rain_influence(idata, viz_meta, m_params["precip_daily"], args.output_dir)
 
-    plot_decoupled_climate_effects(idata, args.output_dir)    
     plot_microclimate_marginals(idata, args.output_dir)
     plot_rainfall_marginals(idata, args.output_dir)
     plot_multiscale_phase_portrait(decomp, idata, viz_meta, args.output_dir)
     plot_climate_timescale_decomposition(decomp, viz_meta, windows_df, args.output_dir)
     
-    # 🌟 NEW: Add the Dataset-Wide Heatmap to the execution loop
-    print("🌡️ Generating entire dataset micro-climate shock footprints...")
-    plot_specific_night_shocks(m_params, windows_df, args.output_dir)
-    plot_intraday_shock_heatmap(m_params, windows_df, args.output_dir)
-
     plot_comprehensive_effect_heatmaps(idata, m_params, windows_df, decomp, viz_meta, B_diel, args.output_dir)
     
     print("✅ Complete visualization execution finished successfully.")

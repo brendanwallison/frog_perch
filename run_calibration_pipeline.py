@@ -82,13 +82,19 @@ def main():
     
     ckpt_dir = config_dict.get("CHECKPOINT_DIR", "")
     csv_path = os.path.join(ckpt_dir, f"{args.ckpt}_multiband_calibration.csv")
+    csv_path_full = os.path.join(ckpt_dir, f"{args.ckpt}_multiband_calibration_full.csv")
 
     if not os.path.exists(csv_path):
         print(f"\n[FATAL ERROR] Extraction failed to produce CSV at: {csv_path}")
         return
+    
+
+    if not os.path.exists(csv_path_full):
+        print(f"\n[FATAL ERROR] Extraction failed to produce CSV at: {csv_path_full}")
+        return
 
     # ---------------------------------------------------------
-    # STEP 2: Bayesian Optimization
+    # STEP 2: Optimization
     # ---------------------------------------------------------
     print("\n--- STEP 2: Optimizing Sensor Model Parameters ---")
     
